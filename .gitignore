@@ -1,0 +1,6 @@
+node_modules/
+dist/
+*.log
+*.dat
+wal.log
+src/test-wal.ts
