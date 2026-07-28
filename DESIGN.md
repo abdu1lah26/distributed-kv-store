@@ -3,6 +3,11 @@
 **Author:** Abdullah
 **Status:** Locked (v1) — scope changes require updating this file first
 **Stack:** TypeScript (ESM, `module: nodenext`), Node.js, Docker Compose
+**Script runner: use `tsx`, not `ts-node`.** `ts-node` (including
+  `--loader ts-node/esm`) is broken with this project's `nodenext` +
+  `"type": "module"` config (`TypeError: Cannot read properties of
+  undefined (reading 'fileExists')`). Always run scripts with
+  `npx tsx <file>`.
 
 ---
 
