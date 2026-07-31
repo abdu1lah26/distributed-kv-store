@@ -99,12 +99,15 @@ before the crash. This is the one behavior you MUST test explicitly
   acceptable tradeoff to document).
 
 ---
-
 ### 4.4.1 WAL Implementation Decisions (locked after Milestone 1 build)
 
-- **No truncation/compaction in Milestone 1** — WAL is append-only and grows
-  unbounded, consistent with Section 2 non-goals. Revisit only if a
-  compaction milestone is added later.
+- **WAL is append-only, never truncated or compacted** — true for Milestone 1
+  (Section 2 non-goal) and remains true through Milestone 2 even after
+  SSTable flushes exist. Correct, but means crash-recovery time grows
+  unbounded with total WAL size over the system's lifetime. Acceptable for
+  a learning-scale project; would need addressing (checkpoint + truncate,
+  or WAL segmentation) in a production system. Revisit only if a
+  compaction milestone is explicitly added later.
 - **fsync on every single append**, not batched — chosen for correctness-first
   over performance, appropriate for a learning project at this stage. Batching
   fsyncs is a valid future optimization and a good interview talking point,
@@ -113,16 +116,37 @@ before the crash. This is the one behavior you MUST test explicitly
   prefix or partial JSON payload — the crash-mid-write scenario from Section
   4.3), `replay()` stops cleanly at that point rather than throwing. This is
   the mechanism that satisfies the Section 4.3 crash-recovery requirement.
+  
+### 4.4.2 MemTable Implementation Decisions
 
-### 4.4.2 MemTable Implementation Decisions (locked after Milestone 1 build)
+**Milestone 1 (superseded — kept for history):**
+- MemTable was backed by a plain `Map<string, string>`, not sorted.
+- Deletes were plain removals from the Map — no tombstones, since there was
+  no older SSTable layer for a delete to shadow yet.
 
-- MemTable is backed by a plain `Map<string, string>` for Milestone 1, not a
-  sorted structure. "Sorted map" in Section 4.1 is about SSTable flush
-  needing sorted output (Section 4.4) — since Milestone 1 has no flush,
-  sortedness is deferred to whichever Milestone 2 step implements it.
-- Deletes are plain removals from the Map in Milestone 1 — no tombstones,
-  since there's no older SSTable layer for a delete to shadow yet. Tombstone
-  semantics become necessary once SSTables exist (Milestone 2).
+**Milestone 2, Step 1 (current):**
+- Deletes are now represented as **tombstones**, not removals. Backing
+  structure is `Map<string, string | Tombstone>`, where `Tombstone` is a
+  unique `Symbol` sentinel (`TOMBSTONE`). The key stays in the Map; only its
+  value changes to the sentinel. This is required now because a flushed
+  SSTable can hold a stale value for a deleted key — the tombstone is what
+  tells a read "stop here, key is deleted" instead of "keep checking older
+  SSTables."
+- `get(key)` returns a discriminated result instead of `string | undefined`:
+  - `{ found: false }` — no entry in MemTable at all, caller should check
+    SSTables next.
+  - `{ found: true, tombstone: true }` — definitively deleted, stop here.
+  - `{ found: true, tombstone: false, value: string }` — live value.
+- `entries()` returns a **sorted array** (not a generator/iterator) of
+  `[key, value | TOMBSTONE]` pairs, sorted at call time rather than
+  continuously maintained. Used by SSTable flush (Milestone 2, Step 2) to
+  write both live values and tombstones to disk. Array (not a lazy iterator)
+  was chosen deliberately to avoid a half-consumed-iterator bug if flush
+  logic needs to pass over entries more than once.
+- **Known consequence:** `Store.ts`'s existing `get()` call sites are built
+  against the old `string | undefined` contract and will not compile
+  against this change until Milestone 2, Step 4 (Store wiring) updates them.
+  This is expected and intentionally deferred, not a bug.
 
 ## 5. Component 2: Raft Consensus
 
@@ -170,8 +194,11 @@ Write a test (script or manual) for each of these. This list IS the rubric for
 
 ## 7. Milestones (each = a runnable, demoable state — commit at each one)
 
-1. 1. Single-node KV store: WAL + MemTable... 
-   **[IN PROGRESS — WAL module (`src/storage/wal.ts`) implemented and tested. MemTable next.]**
+1. Single-node KV store: WAL + MemTable — **✅ DONE.** WAL, MemTable, Store 
+   coordinator all implemented and tested (manual sanity check + 3 durability 
+   test variants: clean-exit replay, SIGKILL mid-write, torn-record 
+   tolerance). Runner: tsx (ts-node incompatible with nodenext, see Tooling 
+   Lock). Commit: [add hash after committing below].
 2. Add SSTable flush + Bloom filter — durable across full process kill/restart.
 3. Wrap with REST API (`GET/PUT/DELETE /kv/:key`) — single node, no Raft yet.
 4. 3-node cluster, Raft leader election only (no log replication) — prove

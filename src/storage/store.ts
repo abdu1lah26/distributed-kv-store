@@ -1,5 +1,5 @@
-import { WriteAheadLog } from './wal.js';
-import { MemTable } from './memtable.js';
+import { WriteAheadLog } from "./wal.js";
+import { MemTable } from "./memtable.js";
 
 /**
  * Coordinates the WAL and MemTable to implement the Milestone 1 write/read
@@ -32,13 +32,13 @@ export class Store {
     await this.wal.open();
 
     for await (const entry of this.wal.replay()) {
-      if (entry.op === 'PUT') {
+      if (entry.op === "PUT") {
         // value is expected to be present for PUT entries written by append();
         // guard defensively in case of unexpected/corrupt data.
         if (entry.value !== undefined) {
           this.memtable.put(entry.key, entry.value);
         }
-      } else if (entry.op === 'DELETE') {
+      } else if (entry.op === "DELETE") {
         this.memtable.delete(entry.key);
       }
     }
@@ -51,7 +51,7 @@ export class Store {
    */
   async put(key: string, value: string): Promise<void> {
     this.assertOpened();
-    await this.wal.append({ op: 'PUT', key, value });
+    await this.wal.append({ op: "PUT", key, value });
     this.memtable.put(key, value);
   }
 
@@ -60,7 +60,7 @@ export class Store {
    */
   async delete(key: string): Promise<void> {
     this.assertOpened();
-    await this.wal.append({ op: 'DELETE', key });
+    await this.wal.append({ op: "DELETE", key });
     this.memtable.delete(key);
   }
 
@@ -69,7 +69,13 @@ export class Store {
    */
   get(key: string): string | undefined {
     this.assertOpened();
-    return this.memtable.get(key);
+    const result = this.memtable.get(key);
+
+    if (!result.found || result.tombstone) {
+      return undefined;
+    }
+
+    return result.value;
   }
 
   /**
@@ -81,7 +87,7 @@ export class Store {
 
   private assertOpened(): void {
     if (!this.opened) {
-      throw new Error('Store.open() must be called before put/delete/get');
+      throw new Error("Store.open() must be called before put/delete/get");
     }
   }
 }
