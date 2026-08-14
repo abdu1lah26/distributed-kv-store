@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { Store } from '../../src/storage/store.js';
 
 /**
@@ -19,7 +20,13 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const store = new Store(walPath);
+  // sstableDir is derived the same way durability.test.ts constructs it
+  // (a "sstables" sibling of wal.log, inside the shared temp dir) rather
+  // than passed as a separate CLI arg, so the two files can't drift out
+  // of sync with each other about where SSTables live for a given run.
+  const sstableDir = path.join(path.dirname(walPath), 'sstables');
+
+  const store = new Store(walPath, sstableDir);
   await store.open();
 
   if (mode === 'fixed') {

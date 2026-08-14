@@ -41,5 +41,5 @@
     "esModuleInterop": true
   },
 
-  "include": ["src/**/*.ts", "test/**/*.ts", "src/storage/sstable.test.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts", "src/test/sstable.test.ts"]
 }

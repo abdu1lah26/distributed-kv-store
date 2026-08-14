@@ -12,10 +12,11 @@
  *  - Compaction/merging (non-goal, DESIGN.md Section 2).
  */
 
-import { promises as fs } from 'node:fs';
-import path from 'node:path';
-import type { GetResult, Tombstone } from './memtable.js';
-import { TOMBSTONE } from './memtable.js';
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import type { GetResult, Tombstone } from "./memtable.js";
+import { TOMBSTONE } from "./memtable.js";
+import { BloomFilter } from "./bloomfilter.js";
 
 /** One key's location within the SSTable file, used for seek-based reads. */
 interface IndexEntry {
@@ -31,7 +32,9 @@ export interface SSTableHandle {
   get(key: string): Promise<GetResult>;
 }
 
-type SSTableLine = { key: string; value: string } | { key: string; tombstone: true };
+type SSTableLine =
+  | { key: string; value: string }
+  | { key: string; tombstone: true };
 
 /**
  * Writes `entries` (already sorted — as returned by MemTable.entries())
@@ -53,14 +56,15 @@ export async function writeSSTable(
   const tmpPath = `${finalPath}.tmp`;
 
   const lines = entries.map(([key, value]) => {
-    const line: SSTableLine = value === TOMBSTONE ? { key, tombstone: true } : { key, value };
+    const line: SSTableLine =
+      value === TOMBSTONE ? { key, tombstone: true } : { key, value };
     return JSON.stringify(line);
   });
-  const content = lines.length > 0 ? lines.join('\n') + '\n' : '';
+  const content = lines.length > 0 ? lines.join("\n") + "\n" : "";
 
-  const handle = await fs.open(tmpPath, 'w');
+  const handle = await fs.open(tmpPath, "w");
   try {
-    await handle.writeFile(content, { encoding: 'utf8' });
+    await handle.writeFile(content, { encoding: "utf8" });
     await handle.sync();
   } finally {
     await handle.close();
@@ -96,7 +100,7 @@ export async function loadSSTable(filepath: string): Promise<SSTableHandle> {
         const lineBuf = buffer.subarray(lineStart, i);
         let parsed: SSTableLine;
         try {
-          parsed = JSON.parse(lineBuf.toString('utf8')) as SSTableLine;
+          parsed = JSON.parse(lineBuf.toString("utf8")) as SSTableLine;
         } catch (err) {
           throw new Error(
             `loadSSTable: failed to parse line at byte offset ${lineStart} in ${filepath}: ${
@@ -114,7 +118,20 @@ export async function loadSSTable(filepath: string): Promise<SSTableHandle> {
   // only ever receives pre-sorted entries (from MemTable.entries()), so no
   // re-sort is needed here.
 
+  // Build the Bloom filter now that the exact key count is known. This is
+  // a second pass, but purely in-memory over `index` (no disk I/O) — the
+  // expensive part (reading and parsing the file) already happened above.
+
+  const filter = BloomFilter.create(index.length);
+  for (const entry of index) {
+    filter.add(entry.key);
+  }
+
   async function get(key: string): Promise<GetResult> {
+    if (!filter.mightContain(key)) {
+      return { found: false };
+    }
+
     let lo = 0;
     let hi = index.length - 1;
 
@@ -123,15 +140,19 @@ export async function loadSSTable(filepath: string): Promise<SSTableHandle> {
       const entry = index[mid]!;
 
       if (entry.key === key) {
-        const fh = await fs.open(filepath, 'r');
+        const fh = await fs.open(filepath, "r");
         try {
           const lineBuf = Buffer.alloc(entry.length);
           await fh.read(lineBuf, 0, entry.length, entry.offset);
-          const parsed = JSON.parse(lineBuf.toString('utf8')) as SSTableLine;
-          if ('tombstone' in parsed && parsed.tombstone) {
+          const parsed = JSON.parse(lineBuf.toString("utf8")) as SSTableLine;
+          if ("tombstone" in parsed && parsed.tombstone) {
             return { found: true, tombstone: true };
           }
-          return { found: true, tombstone: false, value: (parsed as { key: string; value: string }).value };
+          return {
+            found: true,
+            tombstone: false,
+            value: (parsed as { key: string; value: string }).value,
+          };
         } finally {
           await fh.close();
         }

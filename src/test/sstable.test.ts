@@ -5,8 +5,8 @@ import { strict as assert } from "node:assert";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { writeSSTable, loadSSTable } from "./sstable.js";
-import { TOMBSTONE, type Tombstone } from "./memtable.js";
+import { writeSSTable, loadSSTable } from "../storage/sstable.js";
+import { TOMBSTONE, type Tombstone } from "../storage/memtable.js";
 
 function test(name: string, fn: () => Promise<void>): Promise<void> {
   return fn()
