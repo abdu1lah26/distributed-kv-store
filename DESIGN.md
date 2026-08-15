@@ -189,6 +189,14 @@ Also replaced the original test's fixed 150ms wait-before-kill with polling for 
 Store's constructor gained an optional third parameter: `constructor(walPath, sstableDir, thresholds?: { maxKeys?, maxBytes? })`.
 Defaults to the real production values (1000 keys / 1MB) when omitted — every pre-existing 2-arg call site is unaffected. Exists purely so tests can force a flush quickly and deterministically (e.g. `maxKeys: 10`) without waiting on the real threshold. This isn't a test-only hack: the original Section 4.1 wording ("e.g. 1000 keys or 1MB") already implied these were tunable defaults, not hardcoded constants.
 
+### 4.4.8 Bug fix: `Store.open()` didn't create the WAL's parent directory (found during Milestone 3)
+
+`Store.open()` already created `sstableDir` via `mkdir(..., { recursive: true })`, but only *after* calling `wal.open()` — and never created the WAL path's own parent directory at all. `WriteAheadLog.open()` opens its file in `"a+"` mode, which creates the file if missing but not its containing directory, so constructing a `Store` against a not-yet-existing data directory (e.g. a fresh clone, first run, or a fresh Docker volume) threw `ENOENT` on startup. Surfaced by Milestone 3's REST API entrypoint (`src/index.ts`) hitting it on a real `curl` against a clean `./data` directory — the durability test fixtures never hit this because they always create their temp directory (and therefore both paths' parent) via `mkdtemp()` before constructing a `Store`.
+
+Fixed by having `Store` retain `walPath` as a field and run both `mkdir(path.dirname(walPath), { recursive: true })` and `mkdir(sstableDir, { recursive: true })` up front, before any file I/O, rather than only ensuring `sstableDir` after WAL replay. Fixed at the `Store` level rather than in the new entrypoint, since this was an inconsistency in `Store`'s own directory-creation responsibility (it already handled this for `sstableDir`), not a missing caller responsibility — any future `Store` construction against a fresh directory, including Raft nodes in later milestones, would otherwise hit the same bug.
+
+Full Milestone 2 regression suite (`src/test/store.test.ts`, `test/durability.test.ts`, `test/durability-flush.test.ts`) re-run and passing after this change, since it touches committed, tested code.
+
 ---
 
 ## 5. Component 2: Raft Consensus

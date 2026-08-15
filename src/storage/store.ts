@@ -39,6 +39,7 @@ export interface FlushThresholds {
 
 export class Store {
   private readonly wal: WriteAheadLog;
+  private readonly walPath: string;
   private readonly memtable: MemTable;
   private readonly sstableDir: string;
   private readonly maxKeys: number;
@@ -49,6 +50,7 @@ export class Store {
 
   constructor(walPath: string, sstableDir: string, thresholds: FlushThresholds = {}) {
     this.wal = new WriteAheadLog(walPath);
+    this.walPath = walPath;
     this.memtable = new MemTable();
     this.sstableDir = sstableDir;
     this.maxKeys = thresholds.maxKeys ?? DEFAULT_FLUSH_THRESHOLD_KEYS;
@@ -59,6 +61,19 @@ export class Store {
   }
 
   async open(): Promise<void> {
+    // Ensure both the WAL's parent directory and the SSTable directory
+    // exist before anything tries to open a file handle inside either
+    // one. Previously only sstableDir was created here, and only AFTER
+    // wal.open() had already run — inconsistent, and meant a fresh data
+    // directory whose WAL parent didn't exist yet crashed on startup
+    // with ENOENT, even though Store already handled the equivalent
+    // case for sstableDir. Both mkdirs now happen up front, before any
+    // file I/O, so a fresh directory is fully unattended-safe for any
+    // Store construction (including future Raft nodes in later
+    // milestones, not just this API entrypoint).
+    await mkdir(path.dirname(this.walPath), { recursive: true });
+    await mkdir(this.sstableDir, { recursive: true });
+
     await this.wal.open();
 
     for await (const entry of this.wal.replay()) {
@@ -70,8 +85,7 @@ export class Store {
         this.memtable.delete(entry.key);
       }
     }
-
-    await mkdir(this.sstableDir, { recursive: true });
+    
     this.sstables = await this.discoverSSTables();
 
     this.opened = true;
