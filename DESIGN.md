@@ -274,7 +274,20 @@ Write a test (script or manual) for each of these. This list IS the rubric for "
 
 
 **Milestone 2 complete** — full single-node LSM-tree-style storage engine (WAL, MemTable with tombstones, SSTable, Bloom filter, Store coordination with flush triggering) with crash recovery proven under both real SIGKILL and deterministic boundary conditions.
-3. Wrap with REST API (`GET/PUT/DELETE /kv/:key`) — single node, no Raft yet.
+3. Wrap with REST API (`GET/PUT/DELETE /kv/:key`) — single node, no Raft yet — **✅ DONE.**
+   `src/api/server.ts` (`createApp(store)`, testable without a real socket)
+   + `src/index.ts` (real entrypoint, owns Store lifecycle + port binding).
+   10/10 integration tests passing (`test/api.test.ts`), full Milestone 2
+   regression suite re-verified clean. Two real bugs found and fixed along
+   the way: `Store.open()` not creating the WAL's parent directory
+   (Section 4.4.8) and the error middleware collapsing every error to 500
+   instead of respecting `express.json()`'s own 400 on malformed JSON
+   (Section 4.4.9). `package.json` cleaned up to match (stale
+   `main`/`start`/`test` boilerplate replaced with real scripts).
+
+   **Milestone 3 complete** — real, running, curl-able single-node REST
+   API in front of the full Milestone 2 storage engine.
+
 4. 3-node cluster, Raft leader election only (no log replication) — prove election + heartbeats work, kill leader, watch re-election.
 5. Add log replication (AppendEntries, commit index) — this is the hardest milestone, budget the most time here.
 6. Wire client writes through leader-only path with `421 NOT_LEADER` redirect.

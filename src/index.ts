@@ -1,6 +1,6 @@
 import path from "node:path";
-import { Store } from "../storage/store.js";
-import { createApp } from "../api/server.js";
+import { Store } from "./storage/store.js";
+import { createApp } from "./api/server.js";
 
 /**
  * Real entrypoint for Milestone 3 (single-node REST API, no Raft yet —
