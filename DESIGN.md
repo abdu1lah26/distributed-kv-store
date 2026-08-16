@@ -197,6 +197,27 @@ Fixed by having `Store` retain `walPath` as a field and run both `mkdir(path.dir
 
 Full Milestone 2 regression suite (`src/test/store.test.ts`, `test/durability.test.ts`, `test/durability-flush.test.ts`) re-run and passing after this change, since it touches committed, tested code.
 
+### 4.4.9 API Bug Fix: Error Middleware Ignored express.json()'s Own Status Code (found during M3 Step 5)
+
+**Bug:** `src/api/server.ts`'s central error-handling middleware always
+returned `500`, even when the thrown error already carried a correct
+client-error status. Specifically, `express.json()`'s body-parser throws
+a `SyntaxError` with `err.status = 400` when it can't parse a malformed
+JSON request body — but the middleware ignored that and collapsed every
+error to `500`, contradicting the approved API design note ("malformed
+JSON body → Express's own 400"). Found by `test/api.test.ts`'s
+`"PUT with a malformed JSON body returns 400"` test, which failed for
+real (got 500, expected 400) rather than being caught by inspection.
+
+**Fix:** the error middleware now checks `err.status`/`err.statusCode`
+first (covering both property names some error types use) and only
+falls back to `500` when neither is a valid client-error status.
+Confirmed this didn't accidentally swallow real server errors: the
+"unopened `Store` throws a plain `Error`" test case still correctly
+returns `500`, since a plain `Error` has neither property.
+
+**Test coverage:** `test/api.test.ts`, 10/10 passing, including both the
+corrected 400 case and the still-correct 500 case side by side.
 ---
 
 ## 5. Component 2: Raft Consensus

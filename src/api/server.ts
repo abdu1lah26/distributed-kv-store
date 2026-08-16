@@ -83,8 +83,29 @@ export function createApp(store: Store): Express {
   // Central error handler -> JSON 500, not Express's default HTML page.
   // Must have 4 params for Express to recognize it as an error handler.
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    // express.json()'s body-parser throws a SyntaxError with
+    // status/statusCode = 400 on malformed JSON. Respect that when
+    // present instead of always collapsing to 500 — otherwise a client
+    // sending bad JSON gets told "internal server error" for what is
+    // very much a client error, which is both misleading and contrary
+    // to the approved design ("malformed JSON body -> Express's own
+    // 400"). Anything without a recognizable client-error status still
+    // falls through to 500 as a genuine unexpected failure.
+    const status =
+      typeof err === "object" &&
+      err !== null &&
+      "status" in err &&
+      typeof (err as { status: unknown }).status === "number"
+        ? (err as { status: number }).status
+        : typeof err === "object" &&
+            err !== null &&
+            "statusCode" in err &&
+            typeof (err as { statusCode: unknown }).statusCode === "number"
+          ? (err as { statusCode: number }).statusCode
+          : 500;
+
     const message = err instanceof Error ? err.message : "internal server error";
-    res.status(500).json({ error: message });
+    res.status(status).json({ error: message });
   });
 
   return app;
