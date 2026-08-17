@@ -111,8 +111,6 @@ On startup: replay the WAL to rebuild the MemTable to the state it was in before
 * `{ found: false }` — no entry in MemTable at all, caller should check SSTables next.
 * `{ found: true, tombstone: true }` — definitively deleted, stop here.
 * `{ found: true, tombstone: false, value: string }` — live value.
-
-
 * `has()` / `size()` both count tombstoned entries as present — `size()` drives the flush-threshold check (Section 4.1), and a tombstone still occupies space that needs to be flushed out, not silently ignored.
 * `entries()` returns a **sorted array of raw tuples** `[key, value | TOMBSTONE]` (not a discriminated-object shape, not a lazy generator/iterator), sorted at call time rather than continuously maintained. Array chosen deliberately to avoid a half-consumed-iterator bug if flush logic needs to pass over entries more than once. Consumed directly by `writeSSTable()` (Section 4.4.3) — that module imports `TOMBSTONE`/`Tombstone`/`GetResult` from this one and depends on nothing else.
 * `clear()` empties the Map entirely (live values and tombstones) — called after a successful SSTable flush to reset for the next batch.
@@ -216,9 +214,8 @@ Confirmed this didn't accidentally swallow real server errors: the
 "unopened `Store` throws a plain `Error`" test case still correctly
 returns `500`, since a plain `Error` has neither property.
 
-**Test coverage:** `test/api.test.ts`, 10/10 passing, including both the
+## **Test coverage:** `test/api.test.ts`, 10/10 passing, including both the
 corrected 400 case and the still-correct 500 case side by side.
----
 
 ## 5. Component 2: Raft Consensus
 
@@ -236,6 +233,12 @@ corrected 400 case and the still-correct 500 case side by side.
 
 * `POST /raft/request-vote` — `{term, candidateId, lastLogIndex, lastLogTerm}`
 * `POST /raft/append-entries` — `{term, leaderId, prevLogIndex, prevLogTerm, entries[], leaderCommit}` (empty `entries[]` = heartbeat)
+
+### 5.3.1 Known Gap: lastLogIndex/lastLogTerm Stubbed in Milestone 4 (must revisit in Milestone 5)
+
+Milestone 4 (leader election only, no log replication yet) implements RequestVote vote-granting using only term and candidateId comparison. The real Raft RequestVote RPC shape (§5.3) includes lastLogIndex/lastLogTerm, and the Raft paper's vote-granting rule requires rejecting a vote if the candidate's log is less up-to-date than the voter's own log — this "log up-to-date" check is not implemented in Milestone 4. Since there's no real log yet, lastLogIndex/lastLogTerm are stubbed as constants (e.g. 0/0) in the RPC payload and receiver logic.
+
+This is safe only because Milestone 4 has no log to compare. It becomes an election-safety bug the moment Milestone 5 adds real log entries — a node with a stale/shorter log could be voted leader and overwrite committed entries, which is exactly the failure Raft's log up-to-date check exists to prevent. Milestone 5 MUST implement the real comparison (candidate's lastLogTerm > voter's OR equal terms AND candidate's lastLogIndex >= voter's) as part of adding log entries — not treated as optional hardening.
 
 ### 5.4 Client-facing RPC
 
@@ -266,27 +269,28 @@ Write a test (script or manual) for each of these. This list IS the rubric for "
 
 1. Single-node KV store: WAL + MemTable — **✅ DONE.** WAL, MemTable, Store coordinator all implemented and tested (manual sanity check + 3 durability test variants: clean-exit replay, SIGKILL mid-write, torn-record tolerance). Runner: tsx (ts-node incompatible with nodenext, see Tooling Lock).
 2. SSTable flush + Bloom filter, per Section 7 item 2 — **✅ DONE.**
+
 * ✅ **Step 1: MemTable tombstones** — `put`/`delete`/`get`/`has`/`size`/`entries`/`clear`, tombstone sentinel, discriminated `GetResult`. Done, tested, committed. See Section 4.4.2.
 * ✅ **Step 2: SSTable module** — write (temp+rename) + load (byte-offset index) + async `get()` with index+seek reads. 8/8 tests passing. Done, tested, committed. See Section 4.4.3.
 * ✅ **Step 3: Bloom filter** — bit-packed `Uint32Array`, FNV-1a + djb2 double hashing, wired into `SSTable.get()` as a pre-check. 5/5 BloomFilter tests + 8/8 regression SSTable tests passing. Done, tested, committed. See Section 4.4.4.
 * ✅ **Step 4: Store coordinator wiring** — flush-threshold trigger, newest-first SSTable discovery on open(), unified MemTable(sync)/SSTable(async) read path, tombstone shadowing across the boundary. Breaking API change: Store constructor now takes `(walPath, sstableDir)`, `get()` is now async. 7/7 new integration tests + all 3 M1 durability tests re-verified against the new signature. Done, tested, committed.
 * ✅ **Step 5: Durability test with flush involved** — two complementary tests: Test A (real SIGKILL after a genuine flush, verifying recovery combines replayed WAL state with existing SSTable state) and Test B (deterministic delete/overwrite across the flush boundary, verifying tombstones correctly shadow stale flushed values — explicitly NOT a `kill -9` test, documented as testing a different, complementary scenario). Required adding Store's configurable flush thresholds (Section 4.4.7) and fixing 3 type errors caught by `tsc --noEmit` (Section 4.4.6). Done, tested, committed.
 
-
 **Milestone 2 complete** — full single-node LSM-tree-style storage engine (WAL, MemTable with tombstones, SSTable, Bloom filter, Store coordination with flush triggering) with crash recovery proven under both real SIGKILL and deterministic boundary conditions.
 3. Wrap with REST API (`GET/PUT/DELETE /kv/:key`) — single node, no Raft yet — **✅ DONE.**
-   `src/api/server.ts` (`createApp(store)`, testable without a real socket)
-   + `src/index.ts` (real entrypoint, owns Store lifecycle + port binding).
-   10/10 integration tests passing (`test/api.test.ts`), full Milestone 2
-   regression suite re-verified clean. Two real bugs found and fixed along
-   the way: `Store.open()` not creating the WAL's parent directory
-   (Section 4.4.8) and the error middleware collapsing every error to 500
-   instead of respecting `express.json()`'s own 400 on malformed JSON
-   (Section 4.4.9). `package.json` cleaned up to match (stale
-   `main`/`start`/`test` boilerplate replaced with real scripts).
+`src/api/server.ts` (`createApp(store)`, testable without a real socket)
 
-   **Milestone 3 complete** — real, running, curl-able single-node REST
-   API in front of the full Milestone 2 storage engine.
+* `src/index.ts` (real entrypoint, owns Store lifecycle + port binding).
+10/10 integration tests passing (`test/api.test.ts`), full Milestone 2
+regression suite re-verified clean. Two real bugs found and fixed along
+the way: `Store.open()` not creating the WAL's parent directory
+(Section 4.4.8) and the error middleware collapsing every error to 500
+instead of respecting `express.json()`'s own 400 on malformed JSON
+(Section 4.4.9). `package.json` cleaned up to match (stale
+`main`/`start`/`test` boilerplate replaced with real scripts).
+
+**Milestone 3 complete** — real, running, curl-able single-node REST
+API in front of the full Milestone 2 storage engine.
 
 4. 3-node cluster, Raft leader election only (no log replication) — prove election + heartbeats work, kill leader, watch re-election.
 5. Add log replication (AppendEntries, commit index) — this is the hardest milestone, budget the most time here.
@@ -322,7 +326,6 @@ e.g. durability.test.ts and its fixtures
 docker-compose.yml
 README.md → setup + demo instructions
 DESIGN.md → this file
-
 ```
 
 **Two test locations, intentional split — not drift:**
@@ -348,5 +351,4 @@ Going forward: a new unit test for a single module → `src/test/`. A new test t
 * Paste this whole file at the start of any new Claude conversation about this project, or keep it in the repo root for Claude Code to read directly.
 * Update it BEFORE changing scope, not after — if you're tempted to add something not listed here, add it to Section 2/7 first, then build it.
 * **When in doubt about what a module's actual current interface is, check the real file on disk before trusting recollection from earlier in a conversation** — this file has already caught one real drift incident (Section 4.4.2) where a described interface and the actual implemented one disagreed after a long back-and-forth.
-
 ```
