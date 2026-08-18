@@ -22,12 +22,15 @@ import type {
 
 const PEER_REQUEST_TIMEOUT_MS = 100;
 
-// AppendEntries request shape per §5.3. Milestone 4 is heartbeat-only
-// (no real log yet) — see DESIGN.md §5.3.1: prevLogIndex/prevLogTerm/
-// leaderCommit are accepted here in the wire shape for forward
-// compatibility with Milestone 5, but are NOT read or acted on below.
-// entries[] is expected to be empty in M4 (a non-empty entries[] would
-// mean real log replication, which is explicitly out of scope until M5).
+// AppendEntries request shape per §5.3. Still heartbeat-only as of
+// Milestone 5, Step 1 (no real log module yet — that's Step 2):
+// prevLogIndex/prevLogTerm/leaderCommit are accepted here in the wire
+// shape for forward compatibility, but are NOT read or acted on below.
+// entries[] is expected to be empty until Step 2+ add real log
+// replication. Note this is a separate RPC from RequestVote — the
+// lastLogIndex/lastLogTerm up-to-date check landed in node.ts's
+// receiveVoteRequest() as of this step, but has no bearing on
+// AppendEntries, which doesn't carry those fields at all.
 export interface AppendEntriesRequest {
   term: number;
   leaderId: string;
@@ -55,14 +58,24 @@ export function createRaftApp(node: RaftNode): Express {
   app.post("/raft/request-vote", (req, res) => {
     const body = req.body as Partial<VoteRequest>;
 
-    if (typeof body.term !== "number" || typeof body.candidateId !== "string") {
-      res.status(400).json({ error: "Malformed request-vote body: expected {term, candidateId}." });
+    if (
+      typeof body.term !== "number" ||
+      typeof body.candidateId !== "string" ||
+      typeof body.lastLogIndex !== "number" ||
+      typeof body.lastLogTerm !== "number"
+    ) {
+      res.status(400).json({
+        error:
+          "Malformed request-vote body: expected {term, candidateId, lastLogIndex, lastLogTerm}.",
+      });
       return;
     }
 
     const response = node.receiveVoteRequest({
       term: body.term,
       candidateId: body.candidateId,
+      lastLogIndex: body.lastLogIndex,
+      lastLogTerm: body.lastLogTerm,
     });
     res.status(200).json(response);
   });
@@ -228,6 +241,8 @@ export async function runElection(node: RaftNode, peers: PeerConfig[]): Promise<
   const request: VoteRequest = {
     term: electionTerm,
     candidateId: node.nodeId,
+    lastLogIndex: node.lastLogIndex,
+    lastLogTerm: node.lastLogTerm,
   };
 
   const responses = await Promise.all(

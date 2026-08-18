@@ -72,7 +72,7 @@ function closeAll(servers: http.Server[]): Promise<void[]> {
   const app = createRaftApp(node);
   const res = await request(app)
     .post("/raft/request-vote")
-    .send({ term: 1, candidateId: "node-b" });
+    .send({ term: 1, candidateId: "node-b", lastLogIndex: 0, lastLogTerm: 0 });
 
   assertEqual(res.status, 200, "request-vote route returns 200 on a well-formed body");
   assertEqual(res.body, { term: 1, voteGranted: true }, "route returns the node's vote decision");
@@ -98,13 +98,49 @@ function closeAll(servers: http.Server[]): Promise<void[]> {
 }
 
 {
+  // term/candidateId present and well-typed, but lastLogIndex/lastLogTerm
+  // (added Milestone 5, Step 1 per DESIGN.md §5.3.1) are missing.
+  const node = newNode("node-a");
+  const app = createRaftApp(node);
+  const res = await request(app)
+    .post("/raft/request-vote")
+    .send({ term: 1, candidateId: "node-b" });
+
+  assertEqual(res.status, 400, "route returns 400 when lastLogIndex/lastLogTerm are missing");
+  node.stop();
+}
+
+{
   // Second candidate in the same term is refused, exercised over the route.
   const node = newNode("node-a");
   const app = createRaftApp(node);
-  await request(app).post("/raft/request-vote").send({ term: 1, candidateId: "node-b" });
-  const res = await request(app).post("/raft/request-vote").send({ term: 1, candidateId: "node-c" });
+  await request(app)
+    .post("/raft/request-vote")
+    .send({ term: 1, candidateId: "node-b", lastLogIndex: 0, lastLogTerm: 0 });
+  const res = await request(app)
+    .post("/raft/request-vote")
+    .send({ term: 1, candidateId: "node-c", lastLogIndex: 0, lastLogTerm: 0 });
 
   assertEqual(res.body.voteGranted, false, "route refuses a second candidate in the same term");
+  node.stop();
+}
+
+{
+  // Route-level exercise of the log up-to-date check (DESIGN.md §5.3.1,
+  // Milestone 5 Step 1) — the pure logic is unit-tested in node.test.ts;
+  // this confirms the real values actually flow through the HTTP layer
+  // (JSON body -> receiveVoteRequest) rather than being dropped/ignored.
+  const node = new RaftNode({ nodeId: "node-a", randomFn: () => 0.5, lastLogTerm: 5, lastLogIndex: 10 });
+  const app = createRaftApp(node);
+  const res = await request(app)
+    .post("/raft/request-vote")
+    .send({ term: 1, candidateId: "node-b", lastLogIndex: 999, lastLogTerm: 4 });
+
+  assertEqual(
+    res.body.voteGranted,
+    false,
+    "request-vote route rejects a candidate whose lastLogTerm is behind, even over real HTTP",
+  );
   node.stop();
 }
 
@@ -114,7 +150,12 @@ function closeAll(servers: http.Server[]): Promise<void[]> {
   const node = newNode("node-a");
   const { server, peer } = await listen(node);
 
-  const response = await requestVoteFromPeer(peer, { term: 1, candidateId: "node-b" });
+  const response = await requestVoteFromPeer(peer, {
+    term: 1,
+    candidateId: "node-b",
+    lastLogIndex: 0,
+    lastLogTerm: 0,
+  });
   assertEqual(response, { term: 1, voteGranted: true }, "requestVoteFromPeer gets a real vote grant over HTTP");
 
   await closeAll([server]);
@@ -125,7 +166,7 @@ function closeAll(servers: http.Server[]): Promise<void[]> {
   // Unreachable peer (nothing listening on this port) returns null, not a throw.
   const response = await requestVoteFromPeer(
     { id: "ghost", host: "localhost", port: 1 }, // port 1 is reserved/unlikely to be listening
-    { term: 1, candidateId: "node-b" },
+    { term: 1, candidateId: "node-b", lastLogIndex: 0, lastLogTerm: 0 },
   );
   assertEqual(response, null, "requestVoteFromPeer returns null for an unreachable peer instead of throwing");
 }
@@ -204,7 +245,7 @@ function closeAll(servers: http.Server[]): Promise<void[]> {
   const { server: serverB, peer: peerB } = await listen(voterB);
 
   // voterB already voted for a different candidate in term 1 before the election runs.
-  voterB.receiveVoteRequest({ term: 1, candidateId: "node-z" });
+  voterB.receiveVoteRequest({ term: 1, candidateId: "node-z", lastLogIndex: 0, lastLogTerm: 0 });
 
   await runElection(candidate, [peerB]);
 

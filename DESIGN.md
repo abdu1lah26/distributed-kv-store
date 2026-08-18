@@ -234,11 +234,11 @@ corrected 400 case and the still-correct 500 case side by side.
 * `POST /raft/request-vote` — `{term, candidateId, lastLogIndex, lastLogTerm}`
 * `POST /raft/append-entries` — `{term, leaderId, prevLogIndex, prevLogTerm, entries[], leaderCommit}` (empty `entries[]` = heartbeat)
 
-### 5.3.1 Known Gap: lastLogIndex/lastLogTerm Stubbed in Milestone 4 (must revisit in Milestone 5)
+### 5.3.1 Log Up-To-Date Check — Resolved in Milestone 5, Step 1
 
-Milestone 4 (leader election only, no log replication yet) implements RequestVote vote-granting using only term and candidateId comparison. The real Raft RequestVote RPC shape (§5.3) includes lastLogIndex/lastLogTerm, and the Raft paper's vote-granting rule requires rejecting a vote if the candidate's log is less up-to-date than the voter's own log — this "log up-to-date" check is not implemented in Milestone 4. Since there's no real log yet, lastLogIndex/lastLogTerm are stubbed as constants (e.g. 0/0) in the RPC payload and receiver logic.
+Milestone 4 (leader election only, no log replication yet) implemented RequestVote vote-granting using only term and candidateId comparison, with lastLogIndex/lastLogTerm stubbed as constants (0/0) — safe only because no real log existed yet to compare. This was flagged as a must-fix election-safety gap before any real log entries could be added.
 
-This is safe only because Milestone 4 has no log to compare. It becomes an election-safety bug the moment Milestone 5 adds real log entries — a node with a stale/shorter log could be voted leader and overwrite committed entries, which is exactly the failure Raft's log up-to-date check exists to prevent. Milestone 5 MUST implement the real comparison (candidate's lastLogTerm > voter's OR equal terms AND candidate's lastLogIndex >= voter's) as part of adding log entries — not treated as optional hardening.
+**Resolved in Milestone 5, Step 1** (before any log storage was built): `RaftNode` now tracks real `lastLogIndex`/`lastLogTerm` (constructor-injectable and settable via `setLastLogInfo()`, defaulting to `0`/`0` until Step 2 wires in a real log module). `receiveVoteRequest()` in `node.ts` implements the actual Raft rule: reject if the candidate's `lastLogTerm` is lower, or equal term with a lower `lastLogIndex` — checked *before* the `votedFor` check, since an out-of-date candidate must never receive a vote even from a node that hasn't voted yet. The wire format (`VoteRequest`, the `/raft/request-vote` route, and `runElection`'s request-building) was updated end to end to carry real values instead of the stub. Verified via 7 new unit tests covering both grant and reject cases, plus a route-level integration test over real HTTP — full regression against all Milestone 4 election tests confirmed clean.
 
 ### 5.4 Client-facing RPC
 
@@ -292,7 +292,50 @@ instead of respecting `express.json()`'s own 400 on malformed JSON
 **Milestone 3 complete** — real, running, curl-able single-node REST
 API in front of the full Milestone 2 storage engine.
 
-4. 3-node cluster, Raft leader election only (no log replication) — prove election + heartbeats work, kill leader, watch re-election.
+4. 3-node cluster, Raft leader election only (no log replication) — **✅ DONE.**
+
+* ✅ **Step 1: State machine core** — `src/raft/node.ts`: term/vote/state
+  fields, election timer (150-300ms) + heartbeat timer (50ms) with
+  injectable `randomFn` for deterministic tests, pure `becomeFollower`/
+  `becomeCandidate`/`becomeLeader`/`receiveVoteRequest`/`receiveHeartbeat`.
+  43/43 unit tests passing, no networking involved. Done, tested, committed.
+* ✅ **Step 2: Cluster config** — `src/cluster/config.ts`: `NODE_ID`/`PORT`/
+  `PEERS` env var parsing into a validated `ClusterConfig`, pure function
+  over an env-like object (not `process.env` directly) for testability.
+  23/23 unit tests passing, including every malformed-input case. Done,
+  tested, committed.
+* ✅ **Step 3: RequestVote RPC** — `src/raft/rpc.ts`: `createRaftApp(node)`
+  server route + `requestVoteFromPeer`/`runElection` client-side, 100ms
+  peer-timeout (demo-tuned), unreachable peers treated as non-votes not
+  crashes. Includes the `stillValidCandidate` race guard — a concurrent
+  higher-term RPC arriving mid-election must win over a stale majority
+  computed from outdated responses. 15/15 tests passing against real
+  spun-up servers (not mocked fetch), including a genuine timing-based
+  race test verified stable across repeated runs. Done, tested, committed.
+* ✅ **Step 4: AppendEntries RPC (heartbeat-only)** — extended `rpc.ts`:
+  `sendHeartbeatToPeer`/`sendHeartbeats`, leader steps down immediately
+  on discovering a higher term from any peer response (mirror case of
+  Step 3's guard, from the sending side). `prevLogIndex`/`prevLogTerm`/
+  `entries`/`leaderCommit` accepted in the wire shape but not acted on
+  yet, per Section 5.3.1. 31/31 tests passing (appended to `rpc.test.ts`).
+  Done, tested, committed.
+* ✅ **Step 5: Integration test — real 3-node election** —
+  `src/raft/main.ts` (runnable entrypoint wiring config + state machine +
+  RPCs together, binds `0.0.0.0` since these are separate OS processes)
+  and `test/raft-election.test.ts`: spawns 3 real node processes, polls
+  stdout for exactly one `state=leader`, force-kills the leader
+  (cross-platform, same pattern as Section 4.4.5), confirms a different
+  survivor becomes the new leader within a bounded time. Verified
+  stable across 3 repeated full runs, zero orphaned processes after
+  each. Done, tested, committed.
+
+**Milestone 4 complete** — real 3-node Raft cluster with correct leader
+election, verified end-to-end with actual OS processes, real network
+calls, and a real kill/re-election cycle. Known gap carried forward:
+Section 5.3.1's `lastLogIndex`/`lastLogTerm` stub — currently safe only
+because there's no log to compare yet, and MUST be replaced with a real
+log up-to-date check when Milestone 5 adds real log entries, or election
+safety silently breaks.
 5. Add log replication (AppendEntries, commit index) — this is the hardest milestone, budget the most time here.
 6. Wire client writes through leader-only path with `421 NOT_LEADER` redirect.
 7. Run failure-model tests from Section 6, document results (including any that fail initially — document the fix, like your cousin did with the benchmark post. That's the most convincing part of a writeup).
