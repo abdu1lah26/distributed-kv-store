@@ -1,4 +1,5 @@
-// Unit tests for src/raft/node.ts (Milestone 4, Step 1).
+// Unit tests for src/raft/node.ts (Milestone 4, Step 1; updated Milestone
+// 5, Steps 1-2).
 // Plain Node script, run via `npx tsx src/test/node.test.ts` — no test
 // framework, per this project's established convention (§9 / Milestone 2).
 
@@ -178,14 +179,50 @@ function voteRequest(
   node.stop();
 }
 
-// ---- receiveVoteRequest: log up-to-date check (DESIGN.md §5.3.1, Milestone 5 Step 1) ----
-// Injects fake lastLogIndex/lastLogTerm via the constructor option, ahead
-// of any real log module (that's Milestone 5, Step 2) — the whole point
-// of this step being testable in isolation.
+// ---- RaftNode.log / lastLogIndex / lastLogTerm reflect real appends ----
+{
+  const node = newNode("node-a");
+  assertEqual(node.lastLogIndex, 0, "a fresh node has lastLogIndex 0");
+  assertEqual(node.lastLogTerm, 0, "a fresh node has lastLogTerm 0");
+
+  const entry1 = node.log.append(1, { op: "put", key: "a", value: "1" });
+  assertEqual(entry1.index, 1, "first appended entry gets index 1");
+  assertEqual(node.lastLogIndex, 1, "lastLogIndex reflects the real log after one append");
+  assertEqual(node.lastLogTerm, 1, "lastLogTerm reflects the real log after one append");
+
+  const entry2 = node.log.append(2, { op: "delete", key: "a" });
+  assertEqual(entry2.index, 2, "second appended entry gets index 2");
+  assertEqual(node.lastLogIndex, 2, "lastLogIndex reflects the real log after a second append");
+  assertEqual(node.lastLogTerm, 2, "lastLogTerm reflects the real log's newest entry's term");
+
+  node.stop();
+}
+
+// ---- receiveVoteRequest: log up-to-date check (DESIGN.md §5.3.1, Milestone 5 Steps 1-2) ----
+// Grows a node's real log via node.log.append() to reach a target
+// lastLogIndex/lastLogTerm, rather than injecting fake state — the
+// Milestone 5, Step 1 setLastLogInfo() override was removed once the
+// real log (Step 2) existed, so these exercise the real mechanism.
+function growLog(node: RaftNode, targetIndex: number, targetTerm: number): void {
+  if (targetIndex <= 0) {
+    return;
+  }
+  // Filler entries (all but the last) use term 1, which must be <=
+  // targetTerm for every test case below — fine since real Raft terms
+  // are non-decreasing across a log's real lifetime anyway.
+  for (let i = 1; i < targetIndex; i++) {
+    node.log.append(1, { op: "put", key: `filler-${i}`, value: "x" });
+  }
+  node.log.append(targetTerm, { op: "put", key: `final-${targetIndex}`, value: "x" });
+}
+
 {
   // Candidate's lastLogTerm is lower than the voter's -> reject, even
   // though the voter hasn't voted this term and the request term is fine.
-  const node = new RaftNode({ nodeId: "node-a", randomFn: () => 0.5, lastLogTerm: 5, lastLogIndex: 10 });
+  const node = newNode("node-a");
+  growLog(node, 10, 5);
+  assertEqual(node.lastLogIndex, 10, "sanity: growLog reached the intended lastLogIndex");
+  assertEqual(node.lastLogTerm, 5, "sanity: growLog reached the intended lastLogTerm");
   const response = node.receiveVoteRequest(voteRequest(1, "node-b", { lastLogTerm: 4, lastLogIndex: 999 }));
   assertEqual(response.voteGranted, false, "rejects a candidate whose lastLogTerm is behind, regardless of lastLogIndex");
   assertEqual(node.votedFor, null, "votedFor is not set when the candidate's log is behind");
@@ -194,7 +231,8 @@ function voteRequest(
 
 {
   // Equal lastLogTerm, but candidate's lastLogIndex is behind -> reject.
-  const node = new RaftNode({ nodeId: "node-a", randomFn: () => 0.5, lastLogTerm: 5, lastLogIndex: 10 });
+  const node = newNode("node-a");
+  growLog(node, 10, 5);
   const response = node.receiveVoteRequest(voteRequest(1, "node-b", { lastLogTerm: 5, lastLogIndex: 9 }));
   assertEqual(response.voteGranted, false, "rejects a candidate with the same lastLogTerm but a lower lastLogIndex");
   node.stop();
@@ -202,7 +240,8 @@ function voteRequest(
 
 {
   // Equal lastLogTerm and equal lastLogIndex -> "at least as up-to-date", grant.
-  const node = new RaftNode({ nodeId: "node-a", randomFn: () => 0.5, lastLogTerm: 5, lastLogIndex: 10 });
+  const node = newNode("node-a");
+  growLog(node, 10, 5);
   const response = node.receiveVoteRequest(voteRequest(1, "node-b", { lastLogTerm: 5, lastLogIndex: 10 }));
   assertEqual(response.voteGranted, true, "grants when candidate's log is exactly as up-to-date (equal term and index)");
   node.stop();
@@ -211,7 +250,8 @@ function voteRequest(
 {
   // Candidate's lastLogTerm is higher -> grant, even with a lower lastLogIndex
   // (higher term wins outright per the Raft paper's comparison rule).
-  const node = new RaftNode({ nodeId: "node-a", randomFn: () => 0.5, lastLogTerm: 5, lastLogIndex: 10 });
+  const node = newNode("node-a");
+  growLog(node, 10, 5);
   const response = node.receiveVoteRequest(voteRequest(1, "node-b", { lastLogTerm: 6, lastLogIndex: 0 }));
   assertEqual(response.voteGranted, true, "grants when candidate's lastLogTerm is higher, even with a lower lastLogIndex");
   node.stop();
@@ -219,7 +259,8 @@ function voteRequest(
 
 {
   // Equal lastLogTerm, candidate's lastLogIndex is ahead -> grant.
-  const node = new RaftNode({ nodeId: "node-a", randomFn: () => 0.5, lastLogTerm: 5, lastLogIndex: 10 });
+  const node = newNode("node-a");
+  growLog(node, 10, 5);
   const response = node.receiveVoteRequest(voteRequest(1, "node-b", { lastLogTerm: 5, lastLogIndex: 11 }));
   assertEqual(response.voteGranted, true, "grants when candidate's lastLogIndex is ahead at the same lastLogTerm");
   node.stop();
@@ -228,7 +269,8 @@ function voteRequest(
 {
   // The up-to-date check applies even when votedFor is null (first-ever
   // request this term) -- being unvoted does not bypass the log check.
-  const node = new RaftNode({ nodeId: "node-a", randomFn: () => 0.5, lastLogTerm: 3, lastLogIndex: 5 });
+  const node = newNode("node-a");
+  growLog(node, 5, 3);
   assertEqual(node.votedFor, null, "sanity: node has not voted yet");
   const response = node.receiveVoteRequest(voteRequest(1, "node-b", { lastLogTerm: 2, lastLogIndex: 100 }));
   assertEqual(response.voteGranted, false, "an unvoted node still rejects a behind-on-term candidate");
@@ -236,12 +278,13 @@ function voteRequest(
 }
 
 {
-  // setLastLogInfo() lets a node's log state change after construction,
-  // simulating what Milestone 5, Step 2's real log module will drive.
-  const node = new RaftNode({ nodeId: "node-a", randomFn: () => 0.5 }); // starts at 0/0
-  node.setLastLogInfo(7, 3);
-  const behind = node.receiveVoteRequest(voteRequest(1, "node-b", { lastLogTerm: 2, lastLogIndex: 999 }));
-  assertEqual(behind.voteGranted, false, "setLastLogInfo() updates the state the up-to-date check compares against");
+  // An empty log (no entries appended) behaves as lastLogIndex=0,
+  // lastLogTerm=0 — any real candidate log is at least as up-to-date.
+  const node = newNode("node-a");
+  assertEqual(node.lastLogIndex, 0, "sanity: a fresh node's log starts empty (lastLogIndex 0)");
+  assertEqual(node.lastLogTerm, 0, "sanity: a fresh node's log starts empty (lastLogTerm 0)");
+  const response = node.receiveVoteRequest(voteRequest(1, "node-b", { lastLogTerm: 0, lastLogIndex: 0 }));
+  assertEqual(response.voteGranted, true, "grants when both logs are empty (0/0 is trivially up-to-date)");
   node.stop();
 }
 

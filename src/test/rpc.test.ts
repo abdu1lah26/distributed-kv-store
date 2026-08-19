@@ -47,7 +47,9 @@ function newNode(nodeId: string): RaftNode {
 // Spins up a real server for a RaftNode on an ephemeral port ("port 0"
 // lets the OS choose a free one, avoiding collisions between test runs
 // or with anything else running locally).
-async function listen(node: RaftNode): Promise<{ server: http.Server; peer: PeerConfig }> {
+async function listen(
+  node: RaftNode,
+): Promise<{ server: http.Server; peer: PeerConfig }> {
   const app = createRaftApp(node);
   const server = http.createServer(app);
   await new Promise<void>((resolve) => server.listen(0, "localhost", resolve));
@@ -62,7 +64,11 @@ async function listen(node: RaftNode): Promise<{ server: http.Server; peer: Peer
 }
 
 function closeAll(servers: http.Server[]): Promise<void[]> {
-  return Promise.all(servers.map((s) => new Promise<void>((resolve) => s.close(() => resolve()))));
+  return Promise.all(
+    servers.map(
+      (s) => new Promise<void>((resolve) => s.close(() => resolve())),
+    ),
+  );
 }
 
 // ==== Route-level tests via supertest ====
@@ -74,17 +80,31 @@ function closeAll(servers: http.Server[]): Promise<void[]> {
     .post("/raft/request-vote")
     .send({ term: 1, candidateId: "node-b", lastLogIndex: 0, lastLogTerm: 0 });
 
-  assertEqual(res.status, 200, "request-vote route returns 200 on a well-formed body");
-  assertEqual(res.body, { term: 1, voteGranted: true }, "route returns the node's vote decision");
+  assertEqual(
+    res.status,
+    200,
+    "request-vote route returns 200 on a well-formed body",
+  );
+  assertEqual(
+    res.body,
+    { term: 1, voteGranted: true },
+    "route returns the node's vote decision",
+  );
   node.stop();
 }
 
 {
   const node = newNode("node-a");
   const app = createRaftApp(node);
-  const res = await request(app).post("/raft/request-vote").send({ term: "not-a-number" });
+  const res = await request(app)
+    .post("/raft/request-vote")
+    .send({ term: "not-a-number" });
 
-  assertEqual(res.status, 400, "route returns 400 on a malformed body (wrong types)");
+  assertEqual(
+    res.status,
+    400,
+    "route returns 400 on a malformed body (wrong types)",
+  );
   node.stop();
 }
 
@@ -93,7 +113,11 @@ function closeAll(servers: http.Server[]): Promise<void[]> {
   const app = createRaftApp(node);
   const res = await request(app).post("/raft/request-vote").send({});
 
-  assertEqual(res.status, 400, "route returns 400 on a body missing required fields");
+  assertEqual(
+    res.status,
+    400,
+    "route returns 400 on a body missing required fields",
+  );
   node.stop();
 }
 
@@ -106,7 +130,11 @@ function closeAll(servers: http.Server[]): Promise<void[]> {
     .post("/raft/request-vote")
     .send({ term: 1, candidateId: "node-b" });
 
-  assertEqual(res.status, 400, "route returns 400 when lastLogIndex/lastLogTerm are missing");
+  assertEqual(
+    res.status,
+    400,
+    "route returns 400 when lastLogIndex/lastLogTerm are missing",
+  );
   node.stop();
 }
 
@@ -121,7 +149,11 @@ function closeAll(servers: http.Server[]): Promise<void[]> {
     .post("/raft/request-vote")
     .send({ term: 1, candidateId: "node-c", lastLogIndex: 0, lastLogTerm: 0 });
 
-  assertEqual(res.body.voteGranted, false, "route refuses a second candidate in the same term");
+  assertEqual(
+    res.body.voteGranted,
+    false,
+    "route refuses a second candidate in the same term",
+  );
   node.stop();
 }
 
@@ -130,11 +162,24 @@ function closeAll(servers: http.Server[]): Promise<void[]> {
   // Milestone 5 Step 1) — the pure logic is unit-tested in node.test.ts;
   // this confirms the real values actually flow through the HTTP layer
   // (JSON body -> receiveVoteRequest) rather than being dropped/ignored.
-  const node = new RaftNode({ nodeId: "node-a", randomFn: () => 0.5, lastLogTerm: 5, lastLogIndex: 10 });
+  const node = newNode("node-a");
+  // Grow the real log to lastLogIndex=10, lastLogTerm=5 (filler entries
+  // at term 1, final entry at term 5) — mirrors node.test.ts's growLog()
+  // helper, since setLastLogInfo()/constructor injection no longer exist
+  // as of Milestone 5, Step 2's real log module.
+  for (let i = 1; i < 10; i++) {
+    node.log.append(1, { op: "put", key: `filler-${i}`, value: "x" });
+  }
+  node.log.append(5, { op: "put", key: "final-10", value: "x" });
   const app = createRaftApp(node);
   const res = await request(app)
     .post("/raft/request-vote")
-    .send({ term: 1, candidateId: "node-b", lastLogIndex: 999, lastLogTerm: 4 });
+    .send({
+      term: 1,
+      candidateId: "node-b",
+      lastLogIndex: 999,
+      lastLogTerm: 4,
+    });
 
   assertEqual(
     res.body.voteGranted,
@@ -156,7 +201,11 @@ function closeAll(servers: http.Server[]): Promise<void[]> {
     lastLogIndex: 0,
     lastLogTerm: 0,
   });
-  assertEqual(response, { term: 1, voteGranted: true }, "requestVoteFromPeer gets a real vote grant over HTTP");
+  assertEqual(
+    response,
+    { term: 1, voteGranted: true },
+    "requestVoteFromPeer gets a real vote grant over HTTP",
+  );
 
   await closeAll([server]);
   node.stop();
@@ -168,7 +217,11 @@ function closeAll(servers: http.Server[]): Promise<void[]> {
     { id: "ghost", host: "localhost", port: 1 }, // port 1 is reserved/unlikely to be listening
     { term: 1, candidateId: "node-b", lastLogIndex: 0, lastLogTerm: 0 },
   );
-  assertEqual(response, null, "requestVoteFromPeer returns null for an unreachable peer instead of throwing");
+  assertEqual(
+    response,
+    null,
+    "requestVoteFromPeer returns null for an unreachable peer instead of throwing",
+  );
 }
 
 // ==== runElection: majority granted -> becomes leader ====
@@ -178,16 +231,26 @@ function closeAll(servers: http.Server[]): Promise<void[]> {
   const voterB = newNode("node-b");
   const voterC = newNode("node-c");
 
-  const [{ server: serverB, peer: peerB }, { server: serverC, peer: peerC }] = await Promise.all([
-    listen(voterB),
-    listen(voterC),
-  ]);
+  const [{ server: serverB, peer: peerB }, { server: serverC, peer: peerC }] =
+    await Promise.all([listen(voterB), listen(voterC)]);
 
   await runElection(candidate, [peerB, peerC]);
 
-  assertEqual(candidate.state, "leader", "candidate becomes leader after winning a unanimous vote (3/3)");
-  assertEqual(voterB.votedFor, "node-a", "voter B recorded its vote for the candidate");
-  assertEqual(voterC.votedFor, "node-a", "voter C recorded its vote for the candidate");
+  assertEqual(
+    candidate.state,
+    "leader",
+    "candidate becomes leader after winning a unanimous vote (3/3)",
+  );
+  assertEqual(
+    voterB.votedFor,
+    "node-a",
+    "voter B recorded its vote for the candidate",
+  );
+  assertEqual(
+    voterC.votedFor,
+    "node-a",
+    "voter C recorded its vote for the candidate",
+  );
 
   await closeAll([serverB, serverC]);
   candidate.stop();
@@ -202,7 +265,11 @@ function closeAll(servers: http.Server[]): Promise<void[]> {
   const voterB = newNode("node-b");
 
   const { server: serverB, peer: peerB } = await listen(voterB);
-  const unreachablePeer: PeerConfig = { id: "node-c", host: "localhost", port: 1 };
+  const unreachablePeer: PeerConfig = {
+    id: "node-c",
+    host: "localhost",
+    port: 1,
+  };
 
   await runElection(candidate, [peerB, unreachablePeer]);
 
@@ -245,7 +312,12 @@ function closeAll(servers: http.Server[]): Promise<void[]> {
   const { server: serverB, peer: peerB } = await listen(voterB);
 
   // voterB already voted for a different candidate in term 1 before the election runs.
-  voterB.receiveVoteRequest({ term: 1, candidateId: "node-z", lastLogIndex: 0, lastLogTerm: 0 });
+  voterB.receiveVoteRequest({
+    term: 1,
+    candidateId: "node-z",
+    lastLogIndex: 0,
+    lastLogTerm: 0,
+  });
 
   await runElection(candidate, [peerB]);
 
@@ -279,7 +351,7 @@ function closeAll(servers: http.Server[]): Promise<void[]> {
 
   // Typecast the app so TypeScript accepts it in the raw http.createServer
   const app = createRaftApp(voterB) as unknown as http.RequestListener;
-  
+
   const server = http.createServer((req, res) => {
     if (req.url === "/raft/request-vote") {
       // Delay the request before passing it to the Express app
@@ -294,7 +366,11 @@ function closeAll(servers: http.Server[]): Promise<void[]> {
   if (address === null || typeof address === "string") {
     throw new Error("Expected server.address() to return an AddressInfo.");
   }
-  const peerB: PeerConfig = { id: "node-b", host: "localhost", port: address.port };
+  const peerB: PeerConfig = {
+    id: "node-b",
+    host: "localhost",
+    port: address.port,
+  };
 
   const electionPromise = runElection(candidate, [peerB]);
 
@@ -311,7 +387,11 @@ function closeAll(servers: http.Server[]): Promise<void[]> {
     "follower",
     "candidate that was stepped down mid-election by a concurrent higher-term heartbeat does NOT become leader, even though its vote response (once it arrives) would have been a majority",
   );
-  assertEqual(candidate.currentTerm, 99, "candidate's term reflects the concurrent heartbeat, not the stale election term");
+  assertEqual(
+    candidate.currentTerm,
+    99,
+    "candidate's term reflects the concurrent heartbeat, not the stale election term",
+  );
 
   await new Promise<void>((resolve) => server.close(() => resolve()));
   candidate.stop();
@@ -320,7 +400,9 @@ function closeAll(servers: http.Server[]): Promise<void[]> {
 
 // ==== AppendEntries route-level tests via supertest ====
 
-function heartbeatBody(overrides: Partial<AppendEntriesRequest> = {}): AppendEntriesRequest {
+function heartbeatBody(
+  overrides: Partial<AppendEntriesRequest> = {},
+): AppendEntriesRequest {
   return {
     term: 1,
     leaderId: "node-b",
@@ -335,11 +417,25 @@ function heartbeatBody(overrides: Partial<AppendEntriesRequest> = {}): AppendEnt
 {
   const node = newNode("node-a");
   const app = createRaftApp(node);
-  const res = await request(app).post("/raft/append-entries").send(heartbeatBody());
+  const res = await request(app)
+    .post("/raft/append-entries")
+    .send(heartbeatBody());
 
-  assertEqual(res.status, 200, "append-entries route returns 200 on a well-formed heartbeat body");
-  assertEqual(res.body, { term: 1 }, "route returns the node's post-heartbeat term");
-  assertEqual(node.state, "follower", "node remains/becomes follower after a valid heartbeat");
+  assertEqual(
+    res.status,
+    200,
+    "append-entries route returns 200 on a well-formed heartbeat body",
+  );
+  assertEqual(
+    res.body,
+    { term: 1 },
+    "route returns the node's post-heartbeat term",
+  );
+  assertEqual(
+    node.state,
+    "follower",
+    "node remains/becomes follower after a valid heartbeat",
+  );
   node.stop();
 }
 
@@ -350,7 +446,11 @@ function heartbeatBody(overrides: Partial<AppendEntriesRequest> = {}): AppendEnt
     .post("/raft/append-entries")
     .send({ term: "not-a-number", leaderId: "node-b", entries: [] });
 
-  assertEqual(res.status, 400, "append-entries route returns 400 when term has the wrong type");
+  assertEqual(
+    res.status,
+    400,
+    "append-entries route returns 400 when term has the wrong type",
+  );
   node.stop();
 }
 
@@ -361,7 +461,11 @@ function heartbeatBody(overrides: Partial<AppendEntriesRequest> = {}): AppendEnt
     .post("/raft/append-entries")
     .send({ term: 1, leaderId: "node-b" }); // entries missing entirely
 
-  assertEqual(res.status, 400, "append-entries route returns 400 when entries[] is missing");
+  assertEqual(
+    res.status,
+    400,
+    "append-entries route returns 400 when entries[] is missing",
+  );
   node.stop();
 }
 
@@ -372,7 +476,11 @@ function heartbeatBody(overrides: Partial<AppendEntriesRequest> = {}): AppendEnt
     .post("/raft/append-entries")
     .send(heartbeatBody({ entries: "not-an-array" as unknown as unknown[] }));
 
-  assertEqual(res.status, 400, "append-entries route returns 400 when entries is present but not an array");
+  assertEqual(
+    res.status,
+    400,
+    "append-entries route returns 400 when entries is present but not an array",
+  );
   node.stop();
 }
 
@@ -386,7 +494,11 @@ function heartbeatBody(overrides: Partial<AppendEntriesRequest> = {}): AppendEnt
     .post("/raft/append-entries")
     .send({ term: 1, leaderId: "node-b", entries: [] });
 
-  assertEqual(res.status, 200, "append-entries succeeds even without prevLogIndex/prevLogTerm/leaderCommit, since M4 ignores them");
+  assertEqual(
+    res.status,
+    200,
+    "append-entries succeeds even without prevLogIndex/prevLogTerm/leaderCommit, since M4 ignores them",
+  );
   node.stop();
 }
 
@@ -396,8 +508,15 @@ function heartbeatBody(overrides: Partial<AppendEntriesRequest> = {}): AppendEnt
   const node = newNode("node-a");
   const { server, peer } = await listen(node);
 
-  const response = await sendHeartbeatToPeer(peer, heartbeatBody({ term: 1, leaderId: "node-b" }));
-  assertEqual(response, { term: 1 }, "sendHeartbeatToPeer gets a real response over HTTP");
+  const response = await sendHeartbeatToPeer(
+    peer,
+    heartbeatBody({ term: 1, leaderId: "node-b" }),
+  );
+  assertEqual(
+    response,
+    { term: 1 },
+    "sendHeartbeatToPeer gets a real response over HTTP",
+  );
 
   await closeAll([server]);
   node.stop();
@@ -408,7 +527,11 @@ function heartbeatBody(overrides: Partial<AppendEntriesRequest> = {}): AppendEnt
     { id: "ghost", host: "localhost", port: 1 },
     heartbeatBody(),
   );
-  assertEqual(response, null, "sendHeartbeatToPeer returns null for an unreachable peer instead of throwing");
+  assertEqual(
+    response,
+    null,
+    "sendHeartbeatToPeer returns null for an unreachable peer instead of throwing",
+  );
 }
 
 // ==== sendHeartbeats: leader steps down when a peer reports a higher term ====
@@ -428,7 +551,11 @@ function heartbeatBody(overrides: Partial<AppendEntriesRequest> = {}): AppendEnt
   peerBNode.becomeCandidate(); // term 2 — ahead of the leader
   const { server, peer } = await listen(peerBNode);
 
-  assertEqual(leader.state, "leader", "sanity: leader starts as leader before sending heartbeats");
+  assertEqual(
+    leader.state,
+    "leader",
+    "sanity: leader starts as leader before sending heartbeats",
+  );
   assertEqual(leader.currentTerm, 1, "sanity: leader starts at term 1");
 
   await sendHeartbeats(leader, [peer]);
@@ -438,7 +565,11 @@ function heartbeatBody(overrides: Partial<AppendEntriesRequest> = {}): AppendEnt
     "follower",
     "leader steps down to follower after a peer's real response reports a higher term",
   );
-  assertEqual(leader.currentTerm, 2, "leader adopts the higher term reported by the peer");
+  assertEqual(
+    leader.currentTerm,
+    2,
+    "leader adopts the higher term reported by the peer",
+  );
 
   await closeAll([server]);
   leader.stop();
@@ -456,8 +587,16 @@ function heartbeatBody(overrides: Partial<AppendEntriesRequest> = {}): AppendEnt
 
   await sendHeartbeats(leader, [peer]);
 
-  assertEqual(leader.state, "leader", "leader remains leader when no peer reports a higher term");
-  assertEqual(followerNode.currentTerm, 1, "follower adopted the leader's term via the real heartbeat");
+  assertEqual(
+    leader.state,
+    "leader",
+    "leader remains leader when no peer reports a higher term",
+  );
+  assertEqual(
+    followerNode.currentTerm,
+    1,
+    "follower adopted the leader's term via the real heartbeat",
+  );
 
   await closeAll([server]);
   leader.stop();
@@ -473,7 +612,11 @@ function heartbeatBody(overrides: Partial<AppendEntriesRequest> = {}): AppendEnt
 
   await sendHeartbeats(leader, [{ id: "ghost", host: "localhost", port: 1 }]);
 
-  assertEqual(leader.state, "leader", "leader remains leader when heartbeats to peers fail/time out");
+  assertEqual(
+    leader.state,
+    "leader",
+    "leader remains leader when heartbeats to peers fail/time out",
+  );
   leader.stop();
 }
 

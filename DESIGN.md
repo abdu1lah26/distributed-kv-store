@@ -240,6 +240,10 @@ Milestone 4 (leader election only, no log replication yet) implemented RequestVo
 
 **Resolved in Milestone 5, Step 1** (before any log storage was built): `RaftNode` now tracks real `lastLogIndex`/`lastLogTerm` (constructor-injectable and settable via `setLastLogInfo()`, defaulting to `0`/`0` until Step 2 wires in a real log module). `receiveVoteRequest()` in `node.ts` implements the actual Raft rule: reject if the candidate's `lastLogTerm` is lower, or equal term with a lower `lastLogIndex` — checked *before* the `votedFor` check, since an out-of-date candidate must never receive a vote even from a node that hasn't voted yet. The wire format (`VoteRequest`, the `/raft/request-vote` route, and `runElection`'s request-building) was updated end to end to carry real values instead of the stub. Verified via 7 new unit tests covering both grant and reject cases, plus a route-level integration test over real HTTP — full regression against all Milestone 4 election tests confirmed clean.
 
+### 5.3.2 In-Memory-Only Log Storage — Deferred Gap (Milestone 5, Step 2)
+
+`RaftLog` (`src/raft/log.ts`) is entirely in-memory — no persistence. A node's whole log is lost on crash/restart, unlike the storage engine's WAL-backed durability (§4.3). This is a real gap, not a non-issue: it means a restarted node currently cannot recover its log at all, which will need addressing (WAL-backed log persistence, or similar) before this project's failure-model tests in §6 (particularly #2 and #4) can be considered fully passing. Deferred for now; must be resolved before Milestone 5 is considered done.
+
 ### 5.4 Client-facing RPC
 
 * `PUT /kv/:key` `{value}` — only leader accepts; must be committed (majority ack) before returning 200 to client.
@@ -336,7 +340,26 @@ Section 5.3.1's `lastLogIndex`/`lastLogTerm` stub — currently safe only
 because there's no log to compare yet, and MUST be replaced with a real
 log up-to-date check when Milestone 5 adds real log entries, or election
 safety silently breaks.
-5. Add log replication (AppendEntries, commit index) — this is the hardest milestone, budget the most time here.
+5. Add log replication (AppendEntries, commit index) — this is the hardest milestone, budget the most time here — **IN PROGRESS.**
+
+* ✅ **Step 1: Real log up-to-date check** — resolved Section 5.3.1's known
+  gap from Milestone 4: `RaftNode` tracks real `lastLogIndex`/`lastLogTerm`,
+  `receiveVoteRequest()` implements the actual Raft comparison (checked
+  before the `votedFor` check), wire format updated end to end. Full
+  Milestone 4 regression re-verified clean. Done, tested, committed.
+* ✅ **Step 2: In-memory log module** — new `src/raft/log.ts` (`RaftLog`
+  class, array-backed, 1-indexed, documented explicitly to avoid the
+  classic off-by-one footgun), `LogCommand` shape mirroring the WAL entry
+  format (§4.4). `RaftNode` now owns a real `RaftLog` internally;
+  `lastLogIndex`/`lastLogTerm` are pure delegating getters. Step 1's
+  `setLastLogInfo()` escape hatch removed entirely — tests now exercise
+  real `log.append()` behavior, not injected fake state. 36/36 new
+  `log.test.ts` tests + 64/64 `node.test.ts` + 33/33 `rpc.test.ts` +
+  3 repeated clean runs of the full 3-node election integration test,
+  zero orphaned processes. Caught and fixed a latent bug along the way:
+  a stale `RaftNode` constructor call in `rpc.test.ts` had been masked
+  by an `as any` cast that predated this step. In-memory-only storage
+  is a real, tracked gap — see Section 5.3.2. Done, tested, committed.
 6. Wire client writes through leader-only path with `421 NOT_LEADER` redirect.
 7. Run failure-model tests from Section 6, document results (including any that fail initially — document the fix, like your cousin did with the benchmark post. That's the most convincing part of a writeup).
 8. Docker Compose for the 3-node cluster, README with `docker compose up`.

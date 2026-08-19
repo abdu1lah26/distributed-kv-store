@@ -1,19 +1,21 @@
-// Raft node state machine core (Milestone 4, Step 1; updated Milestone 5, Step 1).
+// Raft node state machine core (Milestone 4, Step 1; updated Milestone 5,
+// Steps 1-2).
 //
 // Scope: pure state machine + timers. No HTTP/RPC calls to peers here —
 // that's Step 3 (RequestVote) and Step 4 (AppendEntries heartbeat) from
 // Milestone 4.
 //
-// DESIGN.md §5.3.1 UPDATE (Milestone 5, Step 1): lastLogIndex/lastLogTerm
-// are now real state on this node and the real Raft "log up-to-date"
-// check is implemented in receiveVoteRequest() below. There is still no
-// real log module wired in yet (that's Milestone 5, Step 2) — until then,
-// lastLogIndex/lastLogTerm are tracked as plain fields that default to
-// 0/0 and can be set directly (constructor option or setLastLogInfo()),
-// which is what lets this step's logic be tested in isolation with
-// injected fake values before any real log storage exists underneath it.
-// Step 2 will replace the manual setLastLogInfo() call sites with real
-// updates driven by actual log appends.
+// DESIGN.md §5.3.1 (Milestone 5, Step 1): the real Raft "log up-to-date"
+// check is implemented in receiveVoteRequest() below.
+//
+// Milestone 5, Step 2: lastLogIndex/lastLogTerm are now real delegations
+// to an owned RaftLog instance (src/raft/log.ts) rather than manually-set
+// stand-in fields — the Step 1 setLastLogInfo() escape hatch has been
+// removed entirely. Tests exercise real behavior via node.log.append().
+
+import { RaftLog, type LogCommand, type LogEntry } from "./log.js";
+
+export { type LogCommand, type LogEntry };
 
 export type RaftState = "follower" | "candidate" | "leader";
 
@@ -52,16 +54,6 @@ export interface RaftNodeOptions {
   onHeartbeatDue?: () => void;
   /** Overridable for deterministic tests instead of real randomness. */
   randomFn?: () => number;
-  /**
-   * Initial lastLogIndex, for test injection ahead of Milestone 5, Step 2's
-   * real log module. Defaults to 0 (no log entries).
-   */
-  lastLogIndex?: number;
-  /**
-   * Initial lastLogTerm, for test injection ahead of Milestone 5, Step 2's
-   * real log module. Defaults to 0 (no log entries).
-   */
-  lastLogTerm?: number;
 }
 
 export class RaftNode {
@@ -70,8 +62,7 @@ export class RaftNode {
   private _currentTerm: number;
   private _votedFor: string | null;
   private _state: RaftState;
-  private _lastLogIndex: number;
-  private _lastLogTerm: number;
+  private readonly _log: RaftLog;
 
   private electionTimer: NodeJS.Timeout | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
@@ -85,8 +76,7 @@ export class RaftNode {
     this._currentTerm = 0;
     this._votedFor = null;
     this._state = "follower";
-    this._lastLogIndex = options.lastLogIndex ?? 0;
-    this._lastLogTerm = options.lastLogTerm ?? 0;
+    this._log = new RaftLog();
 
     this.onElectionTimeout = options.onElectionTimeout ?? (() => {});
     this.onHeartbeatDue = options.onHeartbeatDue ?? (() => {});
@@ -108,23 +98,26 @@ export class RaftNode {
   }
 
   get lastLogIndex(): number {
-    return this._lastLogIndex;
+    return this._log.getLastLogIndex();
   }
 
   get lastLogTerm(): number {
-    return this._lastLogTerm;
+    return this._log.getLastLogTerm();
   }
 
   /**
-   * Sets this node's lastLogIndex/lastLogTerm directly. A stand-in for
-   * real log-driven updates until Milestone 5, Step 2 wires in an actual
-   * log module — lets both tests (fake log state) and this step's logic
-   * be exercised without a real log existing yet. Step 2 will call this
-   * (or replace these call sites) as entries are actually appended.
+   * The node's log, exposed directly so callers (tests, and later steps'
+   * AppendEntries leader/follower wiring) can append/read/truncate real
+   * entries rather than going through any node-level indirection. There
+   * is deliberately no setLastLogInfo()-style override anymore — the
+   * Milestone 5, Step 1 escape hatch was removed once this real log
+   * existed, per the same reasoning that ended the Milestone 4, Step 3
+   * fake race-test incident: a manual override sitting next to the real
+   * mechanism is exactly what lets a future test quietly exercise the
+   * fake path instead of the real one.
    */
-  setLastLogInfo(lastLogIndex: number, lastLogTerm: number): void {
-    this._lastLogIndex = lastLogIndex;
-    this._lastLogTerm = lastLogTerm;
+  get log(): RaftLog {
+    return this._log;
   }
 
   /** Stops all timers. Call on node shutdown to avoid leaking handles (e.g. in tests). */
@@ -216,9 +209,9 @@ export class RaftNode {
     }
 
     const candidateLogIsUpToDate =
-      request.lastLogTerm > this._lastLogTerm ||
-      (request.lastLogTerm === this._lastLogTerm &&
-        request.lastLogIndex >= this._lastLogIndex);
+      request.lastLogTerm > this.lastLogTerm ||
+      (request.lastLogTerm === this.lastLogTerm &&
+        request.lastLogIndex >= this.lastLogIndex);
 
     if (!candidateLogIsUpToDate) {
       return { term: this._currentTerm, voteGranted: false };
