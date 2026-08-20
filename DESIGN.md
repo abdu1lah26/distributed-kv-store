@@ -244,6 +244,10 @@ Milestone 4 (leader election only, no log replication yet) implemented RequestVo
 
 `RaftLog` (`src/raft/log.ts`) is entirely in-memory — no persistence. A node's whole log is lost on crash/restart, unlike the storage engine's WAL-backed durability (§4.3). This is a real gap, not a non-issue: it means a restarted node currently cannot recover its log at all, which will need addressing (WAL-backed log persistence, or similar) before this project's failure-model tests in §6 (particularly #2 and #4) can be considered fully passing. Deferred for now; must be resolved before Milestone 5 is considered done.
 
+### 5.3.3 Leader-Side Replication Not Yet Safe Against Conflicting Follower Logs (Milestone 5, Step 3)
+
+`AppendEntriesResponse` gained a `success: boolean` field this step, but the follower-side route (`rpc.ts`) returns `success: true` unconditionally — the real consistency check against `prevLogIndex`/`prevLogTerm` that could ever produce `false` doesn't exist until Milestone 5, Step 4. Consequently, the leader's `nextIndex`/`matchIndex` advancement (`RaftNode.advanceReplicationOnSuccess`) is exercised by real traffic, but the retreat-and-retry path (`retreatReplicationOnFailure`) is not — a follower with a genuinely conflicting log would today be reported as caught-up regardless. `nextIndex` is initialized optimistically per the Raft paper (`lastLogIndex + 1` at election time), which is correct behavior, but relies entirely on Step 4's consistency check to correct a wrong optimistic guess. Must be resolved by Step 4.
+
 ### 5.4 Client-facing RPC
 
 * `PUT /kv/:key` `{value}` — only leader accepts; must be committed (majority ack) before returning 200 to client.
@@ -360,6 +364,25 @@ safety silently breaks.
   a stale `RaftNode` constructor call in `rpc.test.ts` had been masked
   by an `as any` cast that predated this step. In-memory-only storage
   is a real, tracked gap — see Section 5.3.2. Done, tested, committed.
+
+  * ✅ **Step 3: Leader-side AppendEntries with real entries** — per-peer
+  replication state (`nextIndex`/`matchIndex`) now lives on `RaftNode`,
+  initialized in `becomeLeader(peerIds)` (now a required parameter) and
+  cleared on stepping down. `rpc.ts`'s `sendHeartbeats` rewritten to
+  build real per-peer `AppendEntriesRequest`s from the leader's actual
+  log via `buildAppendEntriesRequest`, folded into the existing
+  heartbeat path rather than a parallel one. `AppendEntriesResponse`
+  gained `success: boolean`, stubbed `true` on the follower side for
+  now — see Section 5.3.3 for the resulting tracked gap. Caught two real
+  issues along the way: a dropped variable declaration from a bulk sed
+  edit (`peerBNode`), and two tests that passed vacuously because log
+  entries were appended before `becomeLeader()` instead of after,
+  meaning they tested "replicate nothing to an already-caught-up peer"
+  while believing they tested real entry replication — both fixed.
+  36/36 `log.test.ts` (unchanged) + 84/84 `node.test.ts` + full
+  `rpc.test.ts` clean + 3 repeated clean runs of the election
+  integration test, zero orphaned processes. Done, tested, committed.
+
 6. Wire client writes through leader-only path with `421 NOT_LEADER` redirect.
 7. Run failure-model tests from Section 6, document results (including any that fail initially — document the fix, like your cousin did with the benchmark post. That's the most convincing part of a writeup).
 8. Docker Compose for the 3-node cluster, README with `docker compose up`.

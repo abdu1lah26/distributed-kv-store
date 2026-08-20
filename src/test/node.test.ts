@@ -1,5 +1,5 @@
 // Unit tests for src/raft/node.ts (Milestone 4, Step 1; updated Milestone
-// 5, Steps 1-2).
+// 5, Steps 1-3).
 // Plain Node script, run via `npx tsx src/test/node.test.ts` — no test
 // framework, per this project's established convention (§9 / Milestone 2).
 
@@ -82,9 +82,150 @@ function voteRequest(
 {
   const node = newNode("node-a");
   node.becomeCandidate();
-  node.becomeLeader();
+  node.becomeLeader(["node-b", "node-c"]);
   assertEqual(node.state, "leader", "becomeLeader sets state to leader");
   assertEqual(node.currentTerm, 1, "becomeLeader does not change term");
+  node.stop();
+}
+
+// ---- becomeLeader: replication state initialization (DESIGN.md §5.3.3, Milestone 5 Step 3) ----
+{
+  // Empty log: nextIndex starts at 1 (lastLogIndex 0 + 1) for every peer.
+  const node = newNode("node-a");
+  node.becomeCandidate();
+  node.becomeLeader(["node-b", "node-c"]);
+
+  assertEqual(node.getNextIndex("node-b"), 1, "nextIndex starts at lastLogIndex+1 (1) for peer node-b on an empty log");
+  assertEqual(node.getNextIndex("node-c"), 1, "nextIndex starts at lastLogIndex+1 (1) for peer node-c on an empty log");
+  assertEqual(node.getMatchIndex("node-b"), 0, "matchIndex starts at 0 for peer node-b");
+  assertEqual(node.getMatchIndex("node-c"), 0, "matchIndex starts at 0 for peer node-c");
+  node.stop();
+}
+
+{
+  // Non-empty log: nextIndex should start at the real lastLogIndex+1, not
+  // unconditionally 1 — becomeLeader() must read the log's actual state.
+  const node = newNode("node-a");
+  node.log.append(1, { op: "put", key: "a", value: "1" });
+  node.log.append(1, { op: "put", key: "b", value: "2" });
+  node.becomeCandidate();
+  node.becomeLeader(["node-b"]);
+
+  assertEqual(node.getNextIndex("node-b"), 3, "nextIndex starts at the real lastLogIndex+1 (3) when the log already has entries");
+  assertEqual(node.getMatchIndex("node-b"), 0, "matchIndex still starts at 0 regardless of existing log length");
+  node.stop();
+}
+
+{
+  // A peer never passed to becomeLeader has no tracked replication state.
+  const node = newNode("node-a");
+  node.becomeCandidate();
+  node.becomeLeader(["node-b"]);
+
+  assertEqual(node.getNextIndex("node-z"), undefined, "getNextIndex is undefined for a peer not passed to becomeLeader");
+  assertEqual(node.getMatchIndex("node-z"), undefined, "getMatchIndex is undefined for a peer not passed to becomeLeader");
+  node.stop();
+}
+
+{
+  // A node that never became leader has no tracked replication state for anyone.
+  const node = newNode("node-a");
+  assertEqual(node.getNextIndex("node-b"), undefined, "getNextIndex is undefined before ever becoming leader");
+  assertEqual(node.getMatchIndex("node-b"), undefined, "getMatchIndex is undefined before ever becoming leader");
+  node.stop();
+}
+
+// ---- advanceReplicationOnSuccess / retreatReplicationOnFailure (DESIGN.md §5.3.3) ----
+{
+  const node = newNode("node-a");
+  node.log.append(1, { op: "put", key: "a", value: "1" });
+  node.log.append(1, { op: "put", key: "b", value: "2" });
+  node.becomeCandidate();
+  node.becomeLeader(["node-b"]); // nextIndex=3, matchIndex=0
+
+  node.advanceReplicationOnSuccess("node-b", 2);
+  assertEqual(node.getMatchIndex("node-b"), 2, "advanceReplicationOnSuccess sets matchIndex to the given value");
+  assertEqual(node.getNextIndex("node-b"), 3, "advanceReplicationOnSuccess sets nextIndex to matchIndex + 1");
+  node.stop();
+}
+
+{
+  // Guards against an out-of-order/stale response regressing matchIndex backward.
+  const node = newNode("node-a");
+  node.becomeCandidate();
+  node.becomeLeader(["node-b"]);
+
+  node.advanceReplicationOnSuccess("node-b", 5);
+  node.advanceReplicationOnSuccess("node-b", 2); // stale/out-of-order response arriving late
+  assertEqual(node.getMatchIndex("node-b"), 5, "advanceReplicationOnSuccess never regresses matchIndex backward");
+  node.stop();
+}
+
+{
+  const node = newNode("node-a");
+  node.becomeCandidate();
+  node.becomeLeader(["node-b"]); // nextIndex starts at 1
+
+  node.retreatReplicationOnFailure("node-b");
+  assertEqual(node.getNextIndex("node-b"), 1, "retreatReplicationOnFailure floors nextIndex at 1, never going lower");
+  node.stop();
+}
+
+{
+  const node = newNode("node-a");
+  node.log.append(1, { op: "put", key: "a", value: "1" });
+  node.log.append(1, { op: "put", key: "b", value: "2" });
+  node.log.append(1, { op: "put", key: "c", value: "3" });
+  node.becomeCandidate();
+  node.becomeLeader(["node-b"]); // nextIndex starts at 4
+
+  node.retreatReplicationOnFailure("node-b");
+  assertEqual(node.getNextIndex("node-b"), 3, "retreatReplicationOnFailure decrements nextIndex by one");
+  node.stop();
+}
+
+{
+  // Both methods are no-ops for an untracked peer (e.g. this node is no
+  // longer leader by the time a response arrives) — must not throw.
+  const node = newNode("node-a");
+  node.becomeCandidate();
+  node.becomeLeader(["node-b"]);
+
+  node.advanceReplicationOnSuccess("node-z", 5);
+  node.retreatReplicationOnFailure("node-z");
+  assertEqual(node.getNextIndex("node-z"), undefined, "advance/retreat for an untracked peer id is a silent no-op, not a throw");
+  node.stop();
+}
+
+// ---- becomeFollower clears replication state (DESIGN.md §5.3.3) ----
+{
+  const node = newNode("node-a");
+  node.becomeCandidate();
+  node.becomeLeader(["node-b", "node-c"]);
+  assertEqual(node.getNextIndex("node-b"), 1, "sanity: replication state exists while leader");
+
+  node.becomeFollower(node.currentTerm + 1);
+  assertEqual(node.getNextIndex("node-b"), undefined, "stepping down from leader clears replication state for node-b");
+  assertEqual(node.getNextIndex("node-c"), undefined, "stepping down from leader clears replication state for node-c");
+  node.stop();
+}
+
+{
+  // Fresh leadership after a later election starts with clean state, not
+  // whatever was left over from a previous term as leader.
+  const node = newNode("node-a");
+  node.becomeCandidate();
+  node.becomeLeader(["node-b"]);
+  node.advanceReplicationOnSuccess("node-b", 7);
+  node.becomeFollower(node.currentTerm + 1);
+
+  node.becomeCandidate();
+  node.becomeLeader(["node-b"]);
+  assertEqual(
+    node.getMatchIndex("node-b"),
+    0,
+    "a fresh becomeLeader() call starts matchIndex at 0 again, not carrying over a prior term's progress",
+  );
   node.stop();
 }
 
@@ -120,7 +261,7 @@ function voteRequest(
 {
   const node = newNode("node-a");
   node.becomeCandidate();
-  node.becomeLeader();
+  node.becomeLeader(["node-b", "node-c"]);
   node.becomeFollower(2);
   assertEqual(node.state, "follower", "leader steps down to follower on higher term");
   node.stop();
@@ -323,7 +464,7 @@ function growLog(node: RaftNode, targetIndex: number, targetTerm: number): void 
   // A leader receiving a heartbeat at a higher term steps down.
   const node = newNode("node-a");
   node.becomeCandidate();
-  node.becomeLeader();
+  node.becomeLeader(["node-b", "node-c"]);
   const response = node.receiveHeartbeat({ term: 5, leaderId: "node-b" });
   assertEqual(response.term, 5, "leader adopts higher term from heartbeat");
   assertEqual(node.state, "follower", "leader steps down on higher-term heartbeat");
@@ -382,7 +523,7 @@ function growLog(node: RaftNode, targetIndex: number, targetTerm: number): void 
   assertEqual(heartbeatCount, 0, "onHeartbeatDue does not fire while a follower");
 
   node.becomeCandidate();
-  node.becomeLeader();
+  node.becomeLeader(["node-b", "node-c"]);
   await new Promise((resolve) => setTimeout(resolve, 120));
   assert(heartbeatCount > 0, "onHeartbeatDue fires repeatedly once node becomes leader");
 
@@ -402,7 +543,7 @@ function growLog(node: RaftNode, targetIndex: number, targetTerm: number): void 
 {
   const node = newNode("node-a");
   node.becomeCandidate();
-  node.becomeLeader();
+  node.becomeLeader(["node-b", "node-c"]);
   node.stop();
   // No explicit assertion beyond "process exits" — if timers weren't
   // cleared, this script would hang instead of reaching the summary below.

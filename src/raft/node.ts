@@ -1,9 +1,8 @@
 // Raft node state machine core (Milestone 4, Step 1; updated Milestone 5,
-// Steps 1-2).
+// Steps 1-3).
 //
 // Scope: pure state machine + timers. No HTTP/RPC calls to peers here —
-// that's Step 3 (RequestVote) and Step 4 (AppendEntries heartbeat) from
-// Milestone 4.
+// that's rpc.ts.
 //
 // DESIGN.md §5.3.1 (Milestone 5, Step 1): the real Raft "log up-to-date"
 // check is implemented in receiveVoteRequest() below.
@@ -12,6 +11,13 @@
 // to an owned RaftLog instance (src/raft/log.ts) rather than manually-set
 // stand-in fields — the Step 1 setLastLogInfo() escape hatch has been
 // removed entirely. Tests exercise real behavior via node.log.append().
+//
+// Milestone 5, Step 3: becomeLeader() now takes the cluster's peer ids
+// and initializes per-peer replication state (nextIndex/matchIndex) on
+// this node, per the Raft paper. See DESIGN.md §5.3.3 for a tracked gap:
+// this step's leader-side bookkeeping is not yet safe against a follower
+// with a genuinely conflicting log, since the follower-side consistency
+// check that would ever report success:false doesn't exist until Step 4.
 
 import { RaftLog, type LogCommand, type LogEntry } from "./log.js";
 
@@ -46,6 +52,19 @@ export interface HeartbeatResponse {
   term: number;
 }
 
+/**
+ * Per-peer replication bookkeeping the leader maintains, per the Raft
+ * paper: nextIndex is the index of the next log entry to send to that
+ * peer; matchIndex is the highest index known to be replicated there.
+ * Initialized in becomeLeader() and updated via
+ * advanceReplicationOnSuccess()/retreatReplicationOnFailure() as
+ * AppendEntries responses come back (rpc.ts, Step 3+).
+ */
+export interface PeerReplicationState {
+  nextIndex: number;
+  matchIndex: number;
+}
+
 export interface RaftNodeOptions {
   nodeId: string;
   /** Called when the election timer fires with no heartbeat received. */
@@ -63,6 +82,7 @@ export class RaftNode {
   private _votedFor: string | null;
   private _state: RaftState;
   private readonly _log: RaftLog;
+  private _replicationState: Map<string, PeerReplicationState> = new Map();
 
   private electionTimer: NodeJS.Timeout | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
@@ -150,6 +170,10 @@ export class RaftNode {
 
     if (steppingDownFromLeader) {
       this.stopHeartbeatTimer();
+      // Replication bookkeeping is only meaningful while leader — clear
+      // it so a later becomeLeader() call starts fresh rather than
+      // carrying over stale nextIndex/matchIndex from a prior term.
+      this._replicationState.clear();
     }
     this.resetElectionTimer();
   }
@@ -167,16 +191,78 @@ export class RaftNode {
   }
 
   /**
-   * Transition to leader. Caller (Step 3 logic) is responsible for only
-   * calling this after winning a majority of votes for the current term.
+   * Transition to leader. Caller (rpc.ts's runElection) is responsible
+   * for only calling this after winning a majority of votes for the
+   * current term.
+   *
+   * peerIds: the full cluster's other node ids, used to initialize this
+   * leader's per-peer replication state (Raft paper: nextIndex starts at
+   * lastLogIndex + 1 for every peer, matchIndex starts at 0). Required —
+   * not defaulted to [] — so that any call site that doesn't yet know
+   * its cluster's peer ids fails to compile rather than silently
+   * leaving replication state empty.
    */
-  becomeLeader(): void {
+  becomeLeader(peerIds: string[]): void {
     this._state = "leader";
     if (this.electionTimer !== null) {
       clearTimeout(this.electionTimer);
       this.electionTimer = null;
     }
+
+    this._replicationState = new Map();
+    const initialNextIndex = this.lastLogIndex + 1;
+    for (const peerId of peerIds) {
+      this._replicationState.set(peerId, { nextIndex: initialNextIndex, matchIndex: 0 });
+    }
+
     this.startHeartbeatTimer();
+  }
+
+  /** This peer's nextIndex, or undefined if not currently tracked (not leader, or unknown peer id). */
+  getNextIndex(peerId: string): number | undefined {
+    return this._replicationState.get(peerId)?.nextIndex;
+  }
+
+  /** This peer's matchIndex, or undefined if not currently tracked (not leader, or unknown peer id). */
+  getMatchIndex(peerId: string): number | undefined {
+    return this._replicationState.get(peerId)?.matchIndex;
+  }
+
+  /**
+   * Records a successful AppendEntries response from a peer: advances
+   * matchIndex to the given value (only forward, guarding against an
+   * out-of-order/stale response regressing it) and sets nextIndex to
+   * matchIndex + 1. A no-op if peerId isn't currently tracked (e.g. this
+   * node is no longer leader by the time the response arrives).
+   */
+  advanceReplicationOnSuccess(peerId: string, matchIndex: number): void {
+    const peerState = this._replicationState.get(peerId);
+    if (peerState === undefined) {
+      return;
+    }
+    if (matchIndex > peerState.matchIndex) {
+      peerState.matchIndex = matchIndex;
+    }
+    peerState.nextIndex = matchIndex + 1;
+  }
+
+  /**
+   * Records a rejected AppendEntries response from a peer: decrements
+   * nextIndex by one (per the Raft paper's back-off-and-retry strategy),
+   * floored at 1. A no-op if peerId isn't currently tracked.
+   *
+   * NOTE (DESIGN.md §5.3.3): as of Milestone 5, Step 3, the follower
+   * side always responds success:true (the real consistency check that
+   * would ever trigger this path doesn't exist until Step 4) — so this
+   * method exists and is correct, but is not yet exercised by real
+   * follower behavior.
+   */
+  retreatReplicationOnFailure(peerId: string): void {
+    const peerState = this._replicationState.get(peerId);
+    if (peerState === undefined) {
+      return;
+    }
+    peerState.nextIndex = Math.max(1, peerState.nextIndex - 1);
   }
 
   // ---- RPC-handling logic (pure — no network here) ----

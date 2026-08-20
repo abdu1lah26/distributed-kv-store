@@ -1,4 +1,4 @@
-// Tests for src/raft/rpc.ts (Milestone 4, Steps 3-4).
+// Tests for src/raft/rpc.ts (Milestone 4, Steps 3-4; updated Milestone 5, Step 3).
 // Plain Node script, run via `npx tsx src/test/rpc.test.ts` — no test
 // framework, per this project's established convention (§9).
 //
@@ -428,8 +428,8 @@ function heartbeatBody(
   );
   assertEqual(
     res.body,
-    { term: 1 },
-    "route returns the node's post-heartbeat term",
+    { term: 1, success: true },
+    "route returns the node's post-heartbeat term and success (stubbed true — see DESIGN.md §5.3.3)",
   );
   assertEqual(
     node.state,
@@ -474,7 +474,7 @@ function heartbeatBody(
   const app = createRaftApp(node);
   const res = await request(app)
     .post("/raft/append-entries")
-    .send(heartbeatBody({ entries: "not-an-array" as unknown as unknown[] }));
+    .send({ ...heartbeatBody(), entries: "not-an-array" } as unknown as AppendEntriesRequest);
 
   assertEqual(
     res.status,
@@ -514,8 +514,8 @@ function heartbeatBody(
   );
   assertEqual(
     response,
-    { term: 1 },
-    "sendHeartbeatToPeer gets a real response over HTTP",
+    { term: 1, success: true },
+    "sendHeartbeatToPeer gets a real response over HTTP, including success (stubbed true — see DESIGN.md §5.3.3)",
   );
 
   await closeAll([server]);
@@ -544,7 +544,7 @@ function heartbeatBody(
   // receiveHeartbeat() response will naturally report its own higher term.
   const leader = newNode("node-a");
   leader.becomeCandidate(); // term 1
-  leader.becomeLeader();
+  leader.becomeLeader(["node-b"]);
 
   const peerBNode = newNode("node-b");
   peerBNode.becomeCandidate(); // term 1
@@ -580,7 +580,7 @@ function heartbeatBody(
   // Sanity: when no peer reports a higher term, the leader remains leader.
   const leader = newNode("node-a");
   leader.becomeCandidate();
-  leader.becomeLeader(); // term 1
+  leader.becomeLeader(["node-b"]); // term 1
 
   const followerNode = newNode("node-b"); // stays at term 0 until it hears from the leader
   const { server, peer } = await listen(followerNode);
@@ -608,7 +608,7 @@ function heartbeatBody(
   // count as "higher term" — they simply don't participate in the max()).
   const leader = newNode("node-a");
   leader.becomeCandidate();
-  leader.becomeLeader();
+  leader.becomeLeader(["ghost"]);
 
   await sendHeartbeats(leader, [{ id: "ghost", host: "localhost", port: 1 }]);
 
@@ -618,6 +618,136 @@ function heartbeatBody(
     "leader remains leader when heartbeats to peers fail/time out",
   );
   leader.stop();
+}
+
+// ==== sendHeartbeats: replicates real entries and advances leader-side replication state ====
+
+{
+  const leader = newNode("node-a");
+  leader.becomeCandidate(); // term 1
+  leader.becomeLeader(["node-b"]); // log still empty here -> nextIndex starts at 1
+
+  assertEqual(
+    leader.getNextIndex("node-b"),
+    1,
+    "sanity: nextIndex starts at lastLogIndex+1 (1) for the tracked peer on an empty log",
+  );
+  assertEqual(
+    leader.getMatchIndex("node-b"),
+    0,
+    "sanity: matchIndex starts at 0 for the tracked peer",
+  );
+
+  // Real client writes arrive after this node is already leader — the
+  // scenario Step 3 actually needs to replicate, as opposed to entries
+  // that existed in the log before the leader was elected (those are
+  // covered by becomeLeader()'s own initialization tests in node.test.ts).
+  leader.log.append(1, { op: "put", key: "k1", value: "v1" });
+  leader.log.append(1, { op: "put", key: "k2", value: "v2" });
+
+  const follower = newNode("node-b");
+  const { server, peer } = await listen(follower);
+
+  await sendHeartbeats(leader, [peer]);
+
+  assertEqual(
+    leader.getNextIndex("node-b"),
+    3,
+    "nextIndex advances to lastLogIndex+1 after a successful replication round",
+  );
+  assertEqual(
+    leader.getMatchIndex("node-b"),
+    2,
+    "matchIndex advances to the highest replicated index after a successful round",
+  );
+
+  await closeAll([server]);
+  leader.stop();
+  follower.stop();
+}
+
+{
+  // Verifies the actual wire payload carries real prevLogIndex/prevLogTerm/
+  // entries — the previous test covers leader-side bookkeeping advancing,
+  // this covers what's actually sent over the wire to produce that.
+  const leader = newNode("node-a");
+  leader.becomeCandidate();
+  leader.becomeLeader(["node-b"]); // empty log at election time -> nextIndex starts at 1
+  leader.log.append(1, { op: "put", key: "only-key", value: "only-value" }); // write arrives after election
+
+  let capturedBody: unknown = null;
+  const server = http.createServer((req, res) => {
+    let raw = "";
+    req.on("data", (chunk: Buffer) => {
+      raw += chunk.toString();
+    });
+    req.on("end", () => {
+      capturedBody = JSON.parse(raw);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ term: leader.currentTerm, success: true }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "localhost", resolve));
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("Expected server.address() to return an AddressInfo.");
+  }
+  const peer: PeerConfig = { id: "node-b", host: "localhost", port: address.port };
+
+  await sendHeartbeats(leader, [peer]);
+
+  assertEqual(
+    (capturedBody as AppendEntriesRequest).leaderId,
+    "node-a",
+    "AppendEntries payload carries the real leaderId",
+  );
+  assertEqual(
+    (capturedBody as AppendEntriesRequest).prevLogIndex,
+    0,
+    "the first-ever entry has prevLogIndex 0 (nothing precedes it)",
+  );
+  assertEqual(
+    (capturedBody as AppendEntriesRequest).prevLogTerm,
+    0,
+    "the first-ever entry has prevLogTerm 0 (no prior entry to compare against)",
+  );
+  assertEqual(
+    (capturedBody as AppendEntriesRequest).entries,
+    [{ term: 1, index: 1, command: { op: "put", key: "only-key", value: "only-value" } }],
+    "AppendEntries payload carries the real log entry, not an empty heartbeat",
+  );
+
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  leader.stop();
+}
+
+{
+  // A peer that's already caught up (nextIndex === lastLogIndex + 1, e.g.
+  // no entries were ever appended) still gets a request — with an empty
+  // entries[] — which functions exactly like Milestone 4's heartbeat.
+  const leader = newNode("node-a");
+  leader.becomeCandidate();
+  leader.becomeLeader(["node-b"]); // no log entries appended at all
+
+  const follower = newNode("node-b");
+  const { server, peer } = await listen(follower);
+
+  await sendHeartbeats(leader, [peer]);
+
+  assertEqual(
+    leader.getMatchIndex("node-b"),
+    0,
+    "a caught-up peer's matchIndex stays 0 when there's nothing to replicate",
+  );
+  assertEqual(
+    follower.currentTerm,
+    1,
+    "an empty-entries AppendEntries still functions as a real heartbeat",
+  );
+
+  await closeAll([server]);
+  leader.stop();
+  follower.stop();
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

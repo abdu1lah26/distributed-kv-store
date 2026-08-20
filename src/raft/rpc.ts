@@ -1,9 +1,10 @@
-// RequestVote RPC wiring (Milestone 4, Step 3).
+// RequestVote + AppendEntries RPC wiring (Milestone 4, Step 3-4; updated
+// Milestone 5, Step 3).
 //
 // Sits between the pure state machine (src/raft/node.ts) and cluster
-// config (src/cluster/config.ts): turns RaftNode's onElectionTimeout hook
-// into a real election over HTTP, and exposes the server-side route peers
-// call into.
+// config (src/cluster/config.ts): turns RaftNode's onElectionTimeout/
+// onHeartbeatDue hooks into real HTTP calls, and exposes the server-side
+// routes peers call into.
 //
 // Peer-request timeout (100ms) is tuned for localhost/demo conditions —
 // well under the 150-300ms election timeout so one unreachable peer can't
@@ -15,6 +16,7 @@ import type { PeerConfig } from "../cluster/config.js";
 import type {
   HeartbeatRequest,
   HeartbeatResponse,
+  LogEntry,
   RaftNode,
   VoteRequest,
   VoteResponse,
@@ -22,26 +24,31 @@ import type {
 
 const PEER_REQUEST_TIMEOUT_MS = 100;
 
-// AppendEntries request shape per §5.3. Still heartbeat-only as of
-// Milestone 5, Step 1 (no real log module yet — that's Step 2):
-// prevLogIndex/prevLogTerm/leaderCommit are accepted here in the wire
-// shape for forward compatibility, but are NOT read or acted on below.
-// entries[] is expected to be empty until Step 2+ add real log
-// replication. Note this is a separate RPC from RequestVote — the
-// lastLogIndex/lastLogTerm up-to-date check landed in node.ts's
-// receiveVoteRequest() as of this step, but has no bearing on
-// AppendEntries, which doesn't carry those fields at all.
+// AppendEntries request shape per §5.3. As of Milestone 5, Step 3, this
+// carries REAL log entries built from the leader's per-peer nextIndex
+// (see buildAppendEntriesRequest() below) — no longer heartbeat-only.
+// leaderCommit remains stubbed at 0 (commitIndex advancement is
+// Milestone 5, Step 5's scope, not this step's).
 export interface AppendEntriesRequest {
   term: number;
   leaderId: string;
   prevLogIndex: number;
   prevLogTerm: number;
-  entries: unknown[];
+  entries: LogEntry[];
   leaderCommit: number;
 }
 
 export interface AppendEntriesResponse {
   term: number;
+  /**
+   * Whether the follower accepted and applied the entries. As of
+   * Milestone 5, Step 3 this is unconditionally true on the follower
+   * side below — the real consistency check that could ever produce
+   * false doesn't exist until Step 4. See DESIGN.md §5.3.3: leader-side
+   * nextIndex/matchIndex advancement driven by this field is therefore
+   * NOT yet safe against a follower with a genuinely conflicting log.
+   */
+  success: boolean;
 }
 
 // ---- Server side ----
@@ -95,16 +102,24 @@ export function createRaftApp(node: RaftNode): Express {
       return;
     }
 
-    // M4 scope: only term/leaderId drive behavior (see §5.3.1 note above
-    // this interface). prevLogIndex/prevLogTerm/leaderCommit are ignored;
-    // entries[] is not applied to any log, since there isn't one yet.
+    // Milestone 5, Step 3: term/leaderId still drive the node's state
+    // transition via receiveHeartbeat() (§5.3.1's log up-to-date check
+    // is a RequestVote-only concern, unrelated to this route). Real
+    // entries now arrive in the body, but this route does not yet apply
+    // them to the follower's log or run any consistency check against
+    // prevLogIndex/prevLogTerm — that's Milestone 5, Step 4. success is
+    // unconditionally true here in the meantime; see DESIGN.md §5.3.3.
     const heartbeatRequest: HeartbeatRequest = {
       term: body.term,
       leaderId: body.leaderId,
     };
 
     const response = node.receiveHeartbeat(heartbeatRequest);
-    res.status(200).json(response);
+    const appendEntriesResponse: AppendEntriesResponse = {
+      term: response.term,
+      success: true,
+    };
+    res.status(200).json(appendEntriesResponse);
   });
 
   return app;
@@ -149,10 +164,11 @@ export async function requestVoteFromPeer(
 }
 
 /**
- * Sends an AppendEntries heartbeat (empty entries[], per M4 scope) to a
- * single peer. Same treat-failure-as-null policy as requestVoteFromPeer:
- * an unreachable peer must not crash or block the leader's heartbeat
- * loop.
+ * Sends a single AppendEntries RPC (real entries as of Milestone 5, Step
+ * 3 — an empty entries[] is simply the case where the peer is already
+ * caught up, which still functions as a heartbeat) to one peer. Same
+ * treat-failure-as-null policy as requestVoteFromPeer: an unreachable
+ * peer must not crash or block the leader's replication loop.
  */
 export async function sendHeartbeatToPeer(
   peer: PeerConfig,
@@ -183,40 +199,84 @@ export async function sendHeartbeatToPeer(
 }
 
 /**
- * Leader-side heartbeat broadcast: sends an empty-entries AppendEntries
- * to every peer in parallel. If any peer reports a term higher than this
- * node's own, the leader steps down immediately (node.becomeFollower) —
- * the mirror case of runElection's stillValidCandidate guard: whoever
- * learns of a higher term must yield right away, regardless of what
- * state they were in. Without this, a stale/partitioned-then-rejoined
- * leader could keep sending heartbeats after the cluster has already
- * moved on to a new term and leader.
+ * Builds the AppendEntries request for one peer from the leader's real
+ * log and that peer's tracked nextIndex (Milestone 5, Step 3). Falls
+ * back to lastLogIndex + 1 (i.e. "peer is caught up, send nothing") if
+ * this peer has no tracked replication state yet — defensive only; in
+ * normal operation becomeLeader() initializes every configured peer's
+ * state up front, so this should not be reachable in practice.
+ */
+function buildAppendEntriesRequest(node: RaftNode, peer: PeerConfig): AppendEntriesRequest {
+  const nextIndex = node.getNextIndex(peer.id) ?? node.lastLogIndex + 1;
+  const prevLogIndex = nextIndex - 1;
+  const prevLogTerm = prevLogIndex > 0 ? (node.log.getEntry(prevLogIndex)?.term ?? 0) : 0;
+  const entries = node.log.getEntriesFrom(nextIndex);
+
+  return {
+    term: node.currentTerm,
+    leaderId: node.nodeId,
+    prevLogIndex,
+    prevLogTerm,
+    entries,
+    leaderCommit: 0, // stubbed — commitIndex advancement is Milestone 5, Step 5's scope
+  };
+}
+
+/**
+ * Leader-side replication broadcast: sends a real AppendEntries (per
+ * buildAppendEntriesRequest above) to every peer in parallel, then:
+ *
+ * 1. If any peer reports a term higher than this node's own, the leader
+ *    steps down immediately (node.becomeFollower) — the mirror case of
+ *    runElection's stillValidCandidate guard: whoever learns of a higher
+ *    term must yield right away, regardless of what state they were in.
+ *    Stepping down short-circuits step 2 below: a leader that just
+ *    discovered it isn't one anymore must not also apply stale
+ *    replication-progress updates for a term it no longer holds.
+ * 2. Otherwise, for each peer response: on success, advance that peer's
+ *    nextIndex/matchIndex to reflect the entries just sent; on failure,
+ *    retreat nextIndex by one for a retry on the next round (Raft
+ *    paper's back-off strategy). See DESIGN.md §5.3.3 — success is
+ *    unconditionally true from every real follower as of this step, so
+ *    the failure branch exists but isn't yet exercised by real behavior.
  *
  * Called from RaftNode's onHeartbeatDue hook for a live node (hook
  * wiring itself happens at the node's construction/startup site).
  */
 export async function sendHeartbeats(node: RaftNode, peers: PeerConfig[]): Promise<void> {
   const heartbeatTerm = node.currentTerm;
-  const request: AppendEntriesRequest = {
-    term: heartbeatTerm,
-    leaderId: node.nodeId,
-    prevLogIndex: 0, // stubbed — no log yet, see §5.3.1
-    prevLogTerm: 0, // stubbed — no log yet, see §5.3.1
-    entries: [], // heartbeat-only in M4
-    leaderCommit: 0, // stubbed — no log yet, see §5.3.1
-  };
 
-  const responses = await Promise.all(
-    peers.map((peer) => sendHeartbeatToPeer(peer, request)),
+  const results = await Promise.all(
+    peers.map(async (peer) => {
+      const request = buildAppendEntriesRequest(node, peer);
+      const response = await sendHeartbeatToPeer(peer, request);
+      return { peer, request, response };
+    }),
   );
 
-  const highestPeerTerm = responses.reduce(
-    (max, response) => (response !== null && response.term > max ? response.term : max),
+  const highestPeerTerm = results.reduce(
+    (max, { response }) => (response !== null && response.term > max ? response.term : max),
     heartbeatTerm,
   );
 
   if (highestPeerTerm > node.currentTerm) {
     node.becomeFollower(highestPeerTerm);
+    return;
+  }
+
+  for (const { peer, request, response } of results) {
+    if (response === null) {
+      // Unreachable peer this round — leave its nextIndex/matchIndex
+      // untouched; the next heartbeat interval will retry from the same
+      // point.
+      continue;
+    }
+    if (response.success) {
+      const matchIndex = request.prevLogIndex + request.entries.length;
+      node.advanceReplicationOnSuccess(peer.id, matchIndex);
+    } else {
+      node.retreatReplicationOnFailure(peer.id);
+    }
   }
 }
 
@@ -259,6 +319,6 @@ export async function runElection(node: RaftNode, peers: PeerConfig[]): Promise<
   const stillValidCandidate = node.state === "candidate" && node.currentTerm === electionTerm;
 
   if (votesGranted >= majority && stillValidCandidate) {
-    node.becomeLeader();
+    node.becomeLeader(peers.map((peer) => peer.id));
   }
 }
