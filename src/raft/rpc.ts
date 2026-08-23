@@ -1,10 +1,23 @@
 // RequestVote + AppendEntries RPC wiring (Milestone 4, Step 3-4; updated
-// Milestone 5, Step 3).
+// Milestone 5, Steps 3-5).
 //
 // Sits between the pure state machine (src/raft/node.ts) and cluster
 // config (src/cluster/config.ts): turns RaftNode's onElectionTimeout/
 // onHeartbeatDue hooks into real HTTP calls, and exposes the server-side
 // routes peers call into.
+//
+// Milestone 5, Step 4: AppendEntriesRequest/AppendEntriesResponse are no
+// longer defined here — they now live in node.ts as canonical pure
+// types (mirroring VoteRequest/VoteResponse), since the real consistency-
+// check/append logic (receiveAppendEntries) needs them there too. This
+// file imports them rather than re-declaring a wire-only duplicate.
+//
+// Milestone 5, Step 5: buildAppendEntriesRequest() sends the leader's
+// real commitIndex instead of a stubbed 0, and sendHeartbeats() calls
+// node.recomputeCommitIndex() once per round after processing all
+// replication responses (not per-peer — see node.ts's doc comment on
+// why commit computation is intentionally separate from per-peer
+// matchIndex bookkeeping).
 //
 // Peer-request timeout (100ms) is tuned for localhost/demo conditions —
 // well under the 150-300ms election timeout so one unreachable peer can't
@@ -14,42 +27,14 @@
 import express, { type Express } from "express";
 import type { PeerConfig } from "../cluster/config.js";
 import type {
-  HeartbeatRequest,
-  HeartbeatResponse,
-  LogEntry,
+  AppendEntriesRequest,
+  AppendEntriesResponse,
   RaftNode,
   VoteRequest,
   VoteResponse,
 } from "./node.js";
 
 const PEER_REQUEST_TIMEOUT_MS = 100;
-
-// AppendEntries request shape per §5.3. As of Milestone 5, Step 3, this
-// carries REAL log entries built from the leader's per-peer nextIndex
-// (see buildAppendEntriesRequest() below) — no longer heartbeat-only.
-// leaderCommit remains stubbed at 0 (commitIndex advancement is
-// Milestone 5, Step 5's scope, not this step's).
-export interface AppendEntriesRequest {
-  term: number;
-  leaderId: string;
-  prevLogIndex: number;
-  prevLogTerm: number;
-  entries: LogEntry[];
-  leaderCommit: number;
-}
-
-export interface AppendEntriesResponse {
-  term: number;
-  /**
-   * Whether the follower accepted and applied the entries. As of
-   * Milestone 5, Step 3 this is unconditionally true on the follower
-   * side below — the real consistency check that could ever produce
-   * false doesn't exist until Step 4. See DESIGN.md §5.3.3: leader-side
-   * nextIndex/matchIndex advancement driven by this field is therefore
-   * NOT yet safe against a follower with a genuinely conflicting log.
-   */
-  success: boolean;
-}
 
 // ---- Server side ----
 
@@ -93,33 +78,30 @@ export function createRaftApp(node: RaftNode): Express {
     if (
       typeof body.term !== "number" ||
       typeof body.leaderId !== "string" ||
+      typeof body.prevLogIndex !== "number" ||
+      typeof body.prevLogTerm !== "number" ||
+      typeof body.leaderCommit !== "number" ||
       !Array.isArray(body.entries)
     ) {
       res.status(400).json({
         error:
-          "Malformed append-entries body: expected {term, leaderId, ..., entries: []}.",
+          "Malformed append-entries body: expected {term, leaderId, prevLogIndex, prevLogTerm, entries: [], leaderCommit}.",
       });
       return;
     }
 
-    // Milestone 5, Step 3: term/leaderId still drive the node's state
-    // transition via receiveHeartbeat() (§5.3.1's log up-to-date check
-    // is a RequestVote-only concern, unrelated to this route). Real
-    // entries now arrive in the body, but this route does not yet apply
-    // them to the follower's log or run any consistency check against
-    // prevLogIndex/prevLogTerm — that's Milestone 5, Step 4. success is
-    // unconditionally true here in the meantime; see DESIGN.md §5.3.3.
-    const heartbeatRequest: HeartbeatRequest = {
+    // Milestone 5, Step 4: the real consistency check and log append now
+    // happen here via receiveAppendEntries() — this route no longer
+    // stubs success:true unconditionally (DESIGN.md §5.3.3, resolved).
+    const response = node.receiveAppendEntries({
       term: body.term,
       leaderId: body.leaderId,
-    };
-
-    const response = node.receiveHeartbeat(heartbeatRequest);
-    const appendEntriesResponse: AppendEntriesResponse = {
-      term: response.term,
-      success: true,
-    };
-    res.status(200).json(appendEntriesResponse);
+      prevLogIndex: body.prevLogIndex,
+      prevLogTerm: body.prevLogTerm,
+      entries: body.entries,
+      leaderCommit: body.leaderCommit,
+    });
+    res.status(200).json(response);
   });
 
   return app;
@@ -218,7 +200,7 @@ function buildAppendEntriesRequest(node: RaftNode, peer: PeerConfig): AppendEntr
     prevLogIndex,
     prevLogTerm,
     entries,
-    leaderCommit: 0, // stubbed — commitIndex advancement is Milestone 5, Step 5's scope
+    leaderCommit: node.commitIndex, // real as of Milestone 5, Step 5
   };
 }
 
@@ -236,9 +218,13 @@ function buildAppendEntriesRequest(node: RaftNode, peer: PeerConfig): AppendEntr
  * 2. Otherwise, for each peer response: on success, advance that peer's
  *    nextIndex/matchIndex to reflect the entries just sent; on failure,
  *    retreat nextIndex by one for a retry on the next round (Raft
- *    paper's back-off strategy). See DESIGN.md §5.3.3 — success is
- *    unconditionally true from every real follower as of this step, so
- *    the failure branch exists but isn't yet exercised by real behavior.
+ *    paper's back-off strategy). As of Milestone 5, Step 4, both
+ *    branches are genuinely reachable — the follower-side consistency
+ *    check (DESIGN.md §5.3.3) is now real.
+ * 3. Once every response is processed, recompute commitIndex (Milestone
+ *    5, Step 5) — done once per round after all matchIndex updates are
+ *    in, not per-peer, since the computation needs every peer's current
+ *    matchIndex together to determine a majority.
  *
  * Called from RaftNode's onHeartbeatDue hook for a live node (hook
  * wiring itself happens at the node's construction/startup site).
@@ -278,6 +264,8 @@ export async function sendHeartbeats(node: RaftNode, peers: PeerConfig[]): Promi
       node.retreatReplicationOnFailure(peer.id);
     }
   }
+
+  node.recomputeCommitIndex();
 }
 
 // ---- Election-triggering / vote-counting logic ----

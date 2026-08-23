@@ -1,9 +1,9 @@
 // Unit tests for src/raft/node.ts (Milestone 4, Step 1; updated Milestone
-// 5, Steps 1-3).
+// 5, Steps 1-5).
 // Plain Node script, run via `npx tsx src/test/node.test.ts` — no test
 // framework, per this project's established convention (§9 / Milestone 2).
 
-import { RaftNode } from "../raft/node.js";
+import { RaftNode, type AppendEntriesRequest } from "../raft/node.js";
 
 let passed = 0;
 let failed = 0;
@@ -19,7 +19,7 @@ function assert(condition: boolean, message: string): void {
 
 function assertEqual<T>(actual: T, expected: T, message: string): void {
   assert(
-    actual === expected,
+    JSON.stringify(actual) === JSON.stringify(expected),
     `${message} (expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)})`,
   );
 }
@@ -429,13 +429,33 @@ function growLog(node: RaftNode, targetIndex: number, targetTerm: number): void 
   node.stop();
 }
 
-// ---- receiveHeartbeat ----
+// Builds an AppendEntries request that is a pure heartbeat (empty
+// entries[], prevLogIndex/prevLogTerm/leaderCommit at their trivial
+// "start of log" values) — used for tests that only care about the
+// term/leadership-recognition side effects, mirroring what the old
+// (now-removed) receiveHeartbeat()'s test cases exercised.
+function heartbeat(term: number, leaderId: string): AppendEntriesRequest {
+  return {
+    term,
+    leaderId,
+    prevLogIndex: 0,
+    prevLogTerm: 0,
+    entries: [],
+    leaderCommit: 0,
+  };
+}
+
+// ---- receiveAppendEntries: heartbeat-equivalent behavior (empty entries[]) ----
+// (Milestone 4's receiveHeartbeat() was removed in Milestone 5, Step 4 —
+// an AppendEntries with empty entries[] already was a heartbeat, so these
+// cases now exercise the real, unified method instead of a separate one.)
 {
   const node = newNode("node-a");
-  const response = node.receiveHeartbeat({ term: 1, leaderId: "node-b" });
-  assertEqual(response.term, 1, "follower adopts higher term from heartbeat");
-  assertEqual(node.currentTerm, 1, "currentTerm updated from heartbeat");
-  assertEqual(node.state, "follower", "remains follower after heartbeat at higher term");
+  const response = node.receiveAppendEntries(heartbeat(1, "node-b"));
+  assertEqual(response.term, 1, "follower adopts higher term from a heartbeat-equivalent AppendEntries");
+  assertEqual(response.success, true, "an empty-entries AppendEntries with a trivially-consistent prevLogIndex succeeds");
+  assertEqual(node.currentTerm, 1, "currentTerm updated from the heartbeat");
+  assertEqual(node.state, "follower", "remains follower after a heartbeat at a higher term");
   node.stop();
 }
 
@@ -444,8 +464,9 @@ function growLog(node: RaftNode, targetIndex: number, targetTerm: number): void 
   const node = newNode("node-a");
   node.becomeCandidate(); // term 1
   node.becomeCandidate(); // term 2
-  const response = node.receiveHeartbeat({ term: 1, leaderId: "node-b" });
+  const response = node.receiveAppendEntries(heartbeat(1, "node-b"));
   assertEqual(response.term, 2, "stale heartbeat gets the node's real (higher) term back");
+  assertEqual(response.success, false, "a stale (lower-term) AppendEntries is rejected");
   assertEqual(node.state, "candidate", "state unchanged by a stale heartbeat");
   node.stop();
 }
@@ -454,8 +475,9 @@ function growLog(node: RaftNode, targetIndex: number, targetTerm: number): void 
   // A candidate receiving a same-term heartbeat steps down (someone else won).
   const node = newNode("node-a");
   node.becomeCandidate(); // term 1, candidate
-  const response = node.receiveHeartbeat({ term: 1, leaderId: "node-b" });
+  const response = node.receiveAppendEntries(heartbeat(1, "node-b"));
   assertEqual(response.term, 1, "same-term heartbeat response");
+  assertEqual(response.success, true, "a same-term heartbeat with a trivially-consistent log succeeds");
   assertEqual(node.state, "follower", "candidate steps down on same-term heartbeat from a real leader");
   node.stop();
 }
@@ -465,9 +487,182 @@ function growLog(node: RaftNode, targetIndex: number, targetTerm: number): void 
   const node = newNode("node-a");
   node.becomeCandidate();
   node.becomeLeader(["node-b", "node-c"]);
-  const response = node.receiveHeartbeat({ term: 5, leaderId: "node-b" });
+  const response = node.receiveAppendEntries(heartbeat(5, "node-b"));
   assertEqual(response.term, 5, "leader adopts higher term from heartbeat");
+  assertEqual(response.success, true, "the heartbeat itself succeeds once the leader steps down");
   assertEqual(node.state, "follower", "leader steps down on higher-term heartbeat");
+  node.stop();
+}
+
+// ---- receiveAppendEntries: consistency check + real append (DESIGN.md §5.3.3, Milestone 5 Step 4) ----
+{
+  // prevLogIndex === 0 is trivially consistent ("start of log") — a
+  // follower with an empty log accepts entries starting from index 1.
+  const node = newNode("node-a");
+  const response = node.receiveAppendEntries({
+    term: 1,
+    leaderId: "node-b",
+    prevLogIndex: 0,
+    prevLogTerm: 0,
+    entries: [{ term: 1, index: 1, command: { op: "put", key: "k", value: "v" } }],
+    leaderCommit: 0,
+  });
+  assertEqual(response.success, true, "an empty follower accepts entries starting at index 1 (prevLogIndex 0 is trivial)");
+  assertEqual(node.log.getEntry(1), { term: 1, index: 1, command: { op: "put", key: "k", value: "v" } }, "the entry is really appended to the follower's log");
+  assertEqual(node.lastLogIndex, 1, "lastLogIndex reflects the real append");
+  node.stop();
+}
+
+{
+  // Consistency check fails: follower has no entry at all at prevLogIndex.
+  const node = newNode("node-a"); // empty log
+  const response = node.receiveAppendEntries({
+    term: 1,
+    leaderId: "node-b",
+    prevLogIndex: 5, // follower has nothing here
+    prevLogTerm: 1,
+    entries: [],
+    leaderCommit: 0,
+  });
+  assertEqual(response.success, false, "rejects when the follower has no entry at prevLogIndex at all");
+  node.stop();
+}
+
+{
+  // Consistency check fails: follower has an entry at prevLogIndex, but
+  // with a different term than the leader expects.
+  const node = newNode("node-a");
+  node.log.append(1, { op: "put", key: "a", value: "1" }); // index 1, term 1
+  const response = node.receiveAppendEntries({
+    term: 2,
+    leaderId: "node-b",
+    prevLogIndex: 1,
+    prevLogTerm: 2, // leader thinks index 1 is term 2; follower has term 1
+    entries: [],
+    leaderCommit: 0,
+  });
+  assertEqual(response.success, false, "rejects when the follower's entry at prevLogIndex has a conflicting term");
+  assertEqual(node.log.getEntry(1)?.term, 1, "a failed consistency check does not touch the follower's existing log");
+  node.stop();
+}
+
+{
+  // Real conflict: follower has a stale/wrong entry at an index the
+  // leader is now overwriting -> truncate from there, then append the
+  // leader's version.
+  const node = newNode("node-a");
+  node.log.append(1, { op: "put", key: "a", value: "1" }); // index 1, term 1
+  node.log.append(1, { op: "put", key: "stale", value: "wrong" }); // index 2, term 1 (conflicting)
+  node.log.append(1, { op: "put", key: "also-stale", value: "wrong" }); // index 3, term 1 (must also be discarded)
+
+  const response = node.receiveAppendEntries({
+    term: 2,
+    leaderId: "node-b",
+    prevLogIndex: 1,
+    prevLogTerm: 1, // matches follower's real index 1 -> consistency check passes
+    entries: [{ term: 2, index: 2, command: { op: "put", key: "real", value: "correct" } }],
+    leaderCommit: 0,
+  });
+
+  assertEqual(response.success, true, "a genuine conflict at the append point still succeeds after truncating");
+  assertEqual(node.lastLogIndex, 2, "the stale entries (including index 3, past the conflict) are discarded");
+  assertEqual(
+    node.log.getEntry(2),
+    { term: 2, index: 2, command: { op: "put", key: "real", value: "correct" } },
+    "the leader's real entry replaces the conflicting one",
+  );
+  assertEqual(node.log.getEntry(3), undefined, "everything after the conflict point is gone, not just the conflicting entry itself");
+  node.stop();
+}
+
+{
+  // Explicitly requested case: a retried/duplicate AppendEntries carrying
+  // entries the follower ALREADY has correctly (same term at that index)
+  // must NOT trigger a truncation — only a genuine term conflict should.
+  const node = newNode("node-a");
+  node.log.append(1, { op: "put", key: "a", value: "1" }); // index 1
+  node.log.append(2, { op: "put", key: "b", value: "2" }); // index 2
+
+  const response = node.receiveAppendEntries({
+    term: 2,
+    leaderId: "node-b",
+    prevLogIndex: 0,
+    prevLogTerm: 0,
+    // Same two entries the follower already has, at the same indices and
+    // terms — a retried RPC delivering something already applied.
+    entries: [
+      { term: 1, index: 1, command: { op: "put", key: "a", value: "1" } },
+      { term: 2, index: 2, command: { op: "put", key: "b", value: "2" } },
+    ],
+    leaderCommit: 0,
+  });
+
+  assertEqual(response.success, true, "a duplicate/retried AppendEntries with already-correct entries still succeeds");
+  assertEqual(node.lastLogIndex, 2, "no entries are lost or duplicated by re-receiving an already-applied AppendEntries");
+  assertEqual(
+    node.log.getEntry(1),
+    { term: 1, index: 1, command: { op: "put", key: "a", value: "1" } },
+    "the original index-1 entry object's data is unchanged (not truncated and re-appended)",
+  );
+  assertEqual(
+    node.log.getEntry(2),
+    { term: 2, index: 2, command: { op: "put", key: "b", value: "2" } },
+    "the original index-2 entry's data is unchanged (not truncated and re-appended)",
+  );
+  node.stop();
+}
+
+{
+  // A mix: the first incoming entry already matches (should be skipped,
+  // no truncation), but the second genuinely conflicts (should truncate
+  // from THAT point, not from the first entry).
+  const node = newNode("node-a");
+  node.log.append(1, { op: "put", key: "a", value: "1" }); // index 1 — matches incoming
+  node.log.append(1, { op: "put", key: "stale-b", value: "wrong" }); // index 2 — will conflict
+
+  const response = node.receiveAppendEntries({
+    term: 2,
+    leaderId: "node-b",
+    prevLogIndex: 0,
+    prevLogTerm: 0,
+    entries: [
+      { term: 1, index: 1, command: { op: "put", key: "a", value: "1" } }, // matches -> skip, no truncation
+      { term: 2, index: 2, command: { op: "put", key: "b", value: "2" } }, // conflicts -> truncate from index 2
+    ],
+    leaderCommit: 0,
+  });
+
+  assertEqual(response.success, true, "mixed matching-then-conflicting entries still succeed overall");
+  assertEqual(
+    node.log.getEntry(2),
+    { term: 2, index: 2, command: { op: "put", key: "b", value: "2" } },
+    "only the genuinely conflicting entry (index 2) is replaced",
+  );
+  assertEqual(node.lastLogIndex, 2, "log length reflects only the real conflict resolution, not a truncation at the matching entry");
+  node.stop();
+}
+
+{
+  // Appending past the end of an existing log: some entries are new
+  // (nothing exists there yet), handled the same as an empty log.
+  const node = newNode("node-a");
+  node.log.append(1, { op: "put", key: "a", value: "1" }); // index 1
+
+  const response = node.receiveAppendEntries({
+    term: 1,
+    leaderId: "node-b",
+    prevLogIndex: 1,
+    prevLogTerm: 1,
+    entries: [
+      { term: 1, index: 2, command: { op: "put", key: "b", value: "2" } },
+      { term: 1, index: 3, command: { op: "delete", key: "a" } },
+    ],
+    leaderCommit: 0,
+  });
+
+  assertEqual(response.success, true, "appending genuinely new entries past the end of the log succeeds");
+  assertEqual(node.lastLogIndex, 3, "the follower's log grows to include the new entries");
+  assertEqual(node.log.getEntry(3), { term: 1, index: 3, command: { op: "delete", key: "a" } }, "the new entries are really present");
   node.stop();
 }
 
@@ -499,7 +694,7 @@ function growLog(node: RaftNode, targetIndex: number, targetTerm: number): void 
   });
 
   const interval = setInterval(() => {
-    node.receiveHeartbeat({ term: 0, leaderId: "node-b" });
+    node.receiveAppendEntries(heartbeat(0, "node-b"));
   }, 50);
 
   await new Promise((resolve) => setTimeout(resolve, 250));
@@ -548,6 +743,256 @@ function growLog(node: RaftNode, targetIndex: number, targetTerm: number): void 
   // No explicit assertion beyond "process exits" — if timers weren't
   // cleared, this script would hang instead of reaching the summary below.
   passed++;
+}
+
+// ---- commitIndex: initial state ----
+{
+  const node = newNode("node-a");
+  assertEqual(node.commitIndex, 0, "a fresh node starts with commitIndex 0");
+  node.stop();
+}
+
+// ---- recomputeCommitIndex: no-op when not leader ----
+{
+  const node = newNode("node-a"); // follower
+  node.log.append(1, { op: "put", key: "a", value: "1" });
+  node.recomputeCommitIndex();
+  assertEqual(node.commitIndex, 0, "recomputeCommitIndex is a no-op for a follower (no replication state to compute a majority over)");
+  node.stop();
+}
+
+{
+  const node = newNode("node-a");
+  node.log.append(1, { op: "put", key: "a", value: "1" });
+  node.becomeCandidate(); // candidate, not leader
+  node.recomputeCommitIndex();
+  assertEqual(node.commitIndex, 0, "recomputeCommitIndex is a no-op for a candidate");
+  node.stop();
+}
+
+// ---- recomputeCommitIndex: basic majority advancement ----
+{
+  // 3-node cluster (self + 2 peers): majority is 2.
+  const node = newNode("node-a");
+  node.becomeCandidate(); // term 1
+  node.becomeLeader(["node-b", "node-c"]);
+  node.log.append(1, { op: "put", key: "a", value: "1" }); // index 1, current term
+
+  assertEqual(node.commitIndex, 0, "sanity: commitIndex has not advanced yet (no peer has replicated)");
+
+  node.advanceReplicationOnSuccess("node-b", 1); // one peer catches up -> self+node-b = 2 = majority
+  node.recomputeCommitIndex();
+
+  assertEqual(node.commitIndex, 1, "commitIndex advances once a majority (self + one peer) has replicated a current-term entry");
+  node.stop();
+}
+
+{
+  // Same setup, but only self has the entry (no peer has replicated it yet) -> no majority.
+  const node = newNode("node-a");
+  node.becomeCandidate();
+  node.becomeLeader(["node-b", "node-c"]);
+  node.log.append(1, { op: "put", key: "a", value: "1" });
+
+  node.recomputeCommitIndex();
+
+  assertEqual(node.commitIndex, 0, "commitIndex does not advance without a majority (self alone is 1/3, not a majority)");
+  node.stop();
+}
+
+{
+  // Picks the HIGHEST qualifying index, not just any majority-satisfying one.
+  const node = newNode("node-a");
+  node.becomeCandidate();
+  node.becomeLeader(["node-b", "node-c"]);
+  node.log.append(1, { op: "put", key: "a", value: "1" }); // index 1
+  node.log.append(1, { op: "put", key: "b", value: "2" }); // index 2
+  node.log.append(1, { op: "put", key: "c", value: "3" }); // index 3
+
+  node.advanceReplicationOnSuccess("node-b", 3); // node-b fully caught up
+  node.recomputeCommitIndex();
+
+  assertEqual(node.commitIndex, 3, "commitIndex advances to the highest index with a majority, not just the lowest qualifying one");
+  node.stop();
+}
+
+// ---- recomputeCommitIndex: THE critical safety rule (DESIGN.md, term-matching restriction) ----
+// Explicitly requested dedicated coverage: a leader must NEVER count an
+// entry from an EARLIER term as committed purely from replica counts,
+// even with a full majority replicating it. Only a current-term entry
+// can trigger a NEW commitIndex advancement (Raft paper §5.4.2). This is
+// the single most likely place for a subtle, silent bug (e.g. the
+// entry.term !== this._currentTerm check being dropped or inverted), so
+// these cases are deliberately isolated rather than folded into the
+// general majority tests above.
+{
+  // An entry from an OLDER term has a full majority replicated, but the
+  // leader is now in a LATER term with no current-term entry yet.
+  // commitIndex must stay at 0 despite the majority.
+  const node = newNode("node-a");
+  node.log.append(1, { op: "put", key: "a", value: "1" }); // index 1, term 1 (as if inherited from a prior leader's term)
+  node.becomeCandidate(); // term 1
+  node.becomeCandidate(); // term 2 -- currentTerm is now 2, but the entry is still term 1
+  node.becomeLeader(["node-b"]); // 2-node cluster, majority = 2
+
+  node.advanceReplicationOnSuccess("node-b", 1); // full majority (self + node-b) has index 1
+
+  assertEqual(node.currentTerm, 2, "sanity: leader's current term (2) is ahead of the entry's term (1)");
+
+  node.recomputeCommitIndex();
+
+  assertEqual(
+    node.commitIndex,
+    0,
+    "CRITICAL: a leader must not advance commitIndex on a majority-replicated entry from an EARLIER term than its own — only a current-term entry can trigger a new commit",
+  );
+  node.stop();
+}
+
+{
+  // Same setup as above, but now a real current-term entry is appended
+  // and ALSO reaches a majority -> commitIndex advances to that higher
+  // index, which correctly covers the earlier-term entry too (as an
+  // indirect consequence, per the Raft paper), even though the earlier
+  // entry could never trigger the advancement by itself.
+  const node = newNode("node-a");
+  node.log.append(1, { op: "put", key: "a", value: "1" }); // index 1, term 1
+  node.becomeCandidate(); // term 1
+  node.becomeCandidate(); // term 2
+  node.becomeLeader(["node-b"]);
+  node.log.append(2, { op: "put", key: "b", value: "2" }); // index 2, CURRENT term (2)
+
+  node.advanceReplicationOnSuccess("node-b", 2); // majority has both index 1 and index 2
+
+  node.recomputeCommitIndex();
+
+  assertEqual(
+    node.commitIndex,
+    2,
+    "a majority-replicated CURRENT-term entry (index 2) advances commitIndex, indirectly covering the earlier-term entry below it",
+  );
+  node.stop();
+}
+
+{
+  // A majority replicates an old-term entry (index 1) but NOT a newer
+  // current-term entry (index 2, only self has it) -> commitIndex must
+  // stay at 0, not jump to 1 just because index 1 has a majority.
+  const node = newNode("node-a");
+  node.log.append(1, { op: "put", key: "a", value: "1" }); // index 1, term 1
+  node.becomeCandidate();
+  node.becomeCandidate(); // term 2
+  node.becomeLeader(["node-b"]);
+  node.log.append(2, { op: "put", key: "b", value: "2" }); // index 2, term 2 -- NOT yet replicated to node-b
+
+  node.advanceReplicationOnSuccess("node-b", 1); // node-b only has index 1 (the old-term entry), not index 2
+
+  node.recomputeCommitIndex();
+
+  assertEqual(
+    node.commitIndex,
+    0,
+    "commitIndex stays at 0: index 1 has a majority but is old-term (can't directly commit), and index 2 (current-term) lacks a majority",
+  );
+  node.stop();
+}
+
+// ---- recomputeCommitIndex: never regresses ----
+{
+  const node = newNode("node-a");
+  node.becomeCandidate();
+  node.becomeLeader(["node-b"]);
+  node.log.append(1, { op: "put", key: "a", value: "1" });
+  node.advanceReplicationOnSuccess("node-b", 1);
+  node.recomputeCommitIndex();
+  assertEqual(node.commitIndex, 1, "sanity: commitIndex advanced to 1");
+
+  // A subsequent recompute with no further replication progress must not
+  // regress or otherwise change an already-advanced commitIndex.
+  node.recomputeCommitIndex();
+  assertEqual(node.commitIndex, 1, "calling recomputeCommitIndex again with no new progress leaves commitIndex unchanged");
+  node.stop();
+}
+
+// ---- commitIndex persists across leadership changes ----
+{
+  const node = newNode("node-a");
+  node.becomeCandidate();
+  node.becomeLeader(["node-b"]);
+  node.log.append(1, { op: "put", key: "a", value: "1" });
+  node.advanceReplicationOnSuccess("node-b", 1);
+  node.recomputeCommitIndex();
+  assertEqual(node.commitIndex, 1, "sanity: commitIndex advanced while leader");
+
+  node.becomeFollower(node.currentTerm + 1);
+  assertEqual(node.commitIndex, 1, "commitIndex is NOT reset when stepping down from leader (it reflects a durable fact about the log, not leader-specific state)");
+  node.stop();
+}
+
+// ---- receiveAppendEntries: follower-side commitIndex adoption from leaderCommit ----
+{
+  const node = newNode("node-a"); // empty log, follower
+  const response = node.receiveAppendEntries({
+    term: 1,
+    leaderId: "node-b",
+    prevLogIndex: 0,
+    prevLogTerm: 0,
+    entries: [
+      { term: 1, index: 1, command: { op: "put", key: "a", value: "1" } },
+      { term: 1, index: 2, command: { op: "put", key: "b", value: "2" } },
+    ],
+    leaderCommit: 1, // leader has only committed up through index 1
+  });
+
+  assertEqual(response.success, true, "sanity: the request succeeds");
+  assertEqual(node.commitIndex, 1, "follower adopts leaderCommit (1), not the index of the last entry it just appended (2)");
+  node.stop();
+}
+
+{
+  // leaderCommit capped at the index of the last entry in THIS request,
+  // even if the leader's own commitIndex is further ahead than that —
+  // the follower must never mark something committed that it hasn't
+  // actually confirmed matches the leader's log yet.
+  const node = newNode("node-a");
+  const response = node.receiveAppendEntries({
+    term: 1,
+    leaderId: "node-b",
+    prevLogIndex: 0,
+    prevLogTerm: 0,
+    entries: [{ term: 1, index: 1, command: { op: "put", key: "a", value: "1" } }],
+    leaderCommit: 50, // leader claims much more progress than this batch contains
+  });
+
+  assertEqual(response.success, true, "sanity: the request succeeds");
+  assertEqual(node.commitIndex, 1, "commitIndex is capped at the index of the last entry actually included in this request (1), not the raw leaderCommit value (50)");
+  node.stop();
+}
+
+{
+  // commitIndex only advances forward, never backward, even if a later
+  // (e.g. retried/reordered) request reports a lower leaderCommit.
+  const node = newNode("node-a");
+  node.receiveAppendEntries({
+    term: 1,
+    leaderId: "node-b",
+    prevLogIndex: 0,
+    prevLogTerm: 0,
+    entries: [{ term: 1, index: 1, command: { op: "put", key: "a", value: "1" } }],
+    leaderCommit: 1,
+  });
+  assertEqual(node.commitIndex, 1, "sanity: commitIndex advanced to 1");
+
+  node.receiveAppendEntries({
+    term: 1,
+    leaderId: "node-b",
+    prevLogIndex: 1,
+    prevLogTerm: 1,
+    entries: [],
+    leaderCommit: 0, // stale/reordered — must not regress the follower's commitIndex
+  });
+  assertEqual(node.commitIndex, 1, "a lower leaderCommit in a later request does not regress the follower's commitIndex");
+  node.stop();
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

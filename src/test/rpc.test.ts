@@ -1,4 +1,4 @@
-// Tests for src/raft/rpc.ts (Milestone 4, Steps 3-4; updated Milestone 5, Step 3).
+// Tests for src/raft/rpc.ts (Milestone 4, Steps 3-4; updated Milestone 5, Steps 3-5).
 // Plain Node script, run via `npx tsx src/test/rpc.test.ts` — no test
 // framework, per this project's established convention (§9).
 //
@@ -11,6 +11,7 @@
 import http from "node:http";
 import request from "supertest";
 import { RaftNode } from "../raft/node.js";
+import type { AppendEntriesRequest } from "../raft/node.js";
 import {
   createRaftApp,
   requestVoteFromPeer,
@@ -18,7 +19,6 @@ import {
   sendHeartbeatToPeer,
   sendHeartbeats,
 } from "../raft/rpc.js";
-import type { AppendEntriesRequest } from "../raft/rpc.js";
 import type { PeerConfig } from "../cluster/config.js";
 
 let passed = 0;
@@ -378,7 +378,14 @@ function closeAll(servers: http.Server[]): Promise<void[]> {
   // (and therefore after becomeCandidate() already ran) but before the
   // slow peer response resolves.
   await new Promise((resolve) => setTimeout(resolve, 10));
-  candidate.receiveHeartbeat({ term: 99, leaderId: "node-z" });
+  candidate.receiveAppendEntries({
+    term: 99,
+    leaderId: "node-z",
+    prevLogIndex: 0,
+    prevLogTerm: 0,
+    entries: [],
+    leaderCommit: 0,
+  });
 
   await electionPromise;
 
@@ -485,19 +492,63 @@ function heartbeatBody(
 }
 
 {
-  // prevLogIndex/prevLogTerm/leaderCommit are accepted but ignored per §5.3.1 —
-  // a request omitting them (beyond the required term/leaderId/entries) should
-  // still succeed, since M4 doesn't read them.
+  // Milestone 5, Step 4: prevLogIndex/prevLogTerm/leaderCommit are no
+  // longer ignorable placeholders — receiveAppendEntries() genuinely
+  // reads prevLogIndex/prevLogTerm for the consistency check (§5.3.1's
+  // note about M4 ignoring them no longer applies as of this step), so
+  // the route now requires them rather than silently treating a missing
+  // value as 0 (which would be a dangerous default: it would bypass the
+  // consistency check entirely for a malformed/incomplete request).
   const node = newNode("node-a");
   const app = createRaftApp(node);
   const res = await request(app)
     .post("/raft/append-entries")
-    .send({ term: 1, leaderId: "node-b", entries: [] });
+    .send({ term: 1, leaderId: "node-b", entries: [] }); // missing prevLogIndex/prevLogTerm/leaderCommit
 
   assertEqual(
     res.status,
-    200,
-    "append-entries succeeds even without prevLogIndex/prevLogTerm/leaderCommit, since M4 ignores them",
+    400,
+    "append-entries route now returns 400 when prevLogIndex/prevLogTerm/leaderCommit are missing",
+  );
+  node.stop();
+}
+
+{
+  // The real consistency check, exercised over the route rather than
+  // directly on the node (that's covered in node.test.ts): a follower
+  // with an empty log rejects a prevLogIndex it has no entry for.
+  const node = newNode("node-a"); // empty log
+  const app = createRaftApp(node);
+  const res = await request(app)
+    .post("/raft/append-entries")
+    .send(heartbeatBody({ prevLogIndex: 5, prevLogTerm: 1 }));
+
+  assertEqual(
+    res.body,
+    { term: 1, success: false },
+    "route-level consistency check rejects a prevLogIndex the follower has no entry for",
+  );
+  node.stop();
+}
+
+{
+  // The route-level happy path: real entries actually get appended to
+  // the follower's log via the HTTP layer, not just accepted.
+  const node = newNode("node-a"); // empty log
+  const app = createRaftApp(node);
+  const res = await request(app)
+    .post("/raft/append-entries")
+    .send(
+      heartbeatBody({
+        entries: [{ term: 1, index: 1, command: { op: "put", key: "k", value: "v" } }],
+      }),
+    );
+
+  assertEqual(res.body.success, true, "route accepts a real entry appended via a well-formed request");
+  assertEqual(
+    node.log.getEntry(1),
+    { term: 1, index: 1, command: { op: "put", key: "k", value: "v" } },
+    "the entry is really applied to the node's log through the HTTP route, not just acknowledged",
   );
   node.stop();
 }
@@ -541,7 +592,7 @@ function heartbeatBody(
   // it learns of a higher term, from the *sending* side this time rather
   // than the receiving side. peerB here is already ahead (e.g. it won an
   // election the leader doesn't know about yet) and its real
-  // receiveHeartbeat() response will naturally report its own higher term.
+  // receiveAppendEntries() response will naturally report its own higher term.
   const leader = newNode("node-a");
   leader.becomeCandidate(); // term 1
   leader.becomeLeader(["node-b"]);
@@ -748,6 +799,106 @@ function heartbeatBody(
   await closeAll([server]);
   leader.stop();
   follower.stop();
+}
+
+// ==== sendHeartbeats: leader-side commitIndex advances via a real replication round (Milestone 5, Step 5) ====
+
+{
+  const leader = newNode("node-a");
+  leader.becomeCandidate(); // term 1
+  leader.becomeLeader(["node-b"]); // 2-node cluster, majority = 2
+  leader.log.append(1, { op: "put", key: "k", value: "v" }); // index 1, current term
+
+  const follower = newNode("node-b");
+  const { server, peer } = await listen(follower);
+
+  assertEqual(leader.commitIndex, 0, "sanity: commitIndex has not advanced before any replication round");
+
+  await sendHeartbeats(leader, [peer]);
+
+  assertEqual(
+    leader.commitIndex,
+    1,
+    "leader's commitIndex advances after a real replication round reaches a majority",
+  );
+
+  await closeAll([server]);
+  leader.stop();
+  follower.stop();
+}
+
+{
+  // With no peers actually reachable, the leader alone never forms a
+  // majority in a 2-node cluster (self=1/2, not a majority) -> commitIndex
+  // must not advance.
+  const leader = newNode("node-a");
+  leader.becomeCandidate();
+  leader.becomeLeader(["ghost"]);
+  leader.log.append(1, { op: "put", key: "k", value: "v" });
+
+  await sendHeartbeats(leader, [{ id: "ghost", host: "localhost", port: 1 }]);
+
+  assertEqual(
+    leader.commitIndex,
+    0,
+    "commitIndex does not advance when no peer is actually reachable to form a majority",
+  );
+  leader.stop();
+}
+
+// ==== sendHeartbeats: follower adopts real leaderCommit over the wire (Milestone 5, Step 5) ====
+
+{
+  const leader = newNode("node-a");
+  leader.becomeCandidate();
+  leader.becomeLeader(["node-b"]);
+  leader.log.append(1, { op: "put", key: "k", value: "v" }); // index 1
+
+  const follower = newNode("node-b");
+  const { server, peer } = await listen(follower);
+
+  // Round 1: replicates the entry and advances the leader's commitIndex,
+  // but the follower doesn't yet know about it (this round's leaderCommit
+  // was sent BEFORE the leader's own commitIndex advanced this round).
+  await sendHeartbeats(leader, [peer]);
+  assertEqual(leader.commitIndex, 1, "sanity: leader's commitIndex advanced after round 1");
+
+  // Round 2: the leader now sends its real (already-advanced) commitIndex
+  // in a follow-up heartbeat; the follower should adopt it.
+  await sendHeartbeats(leader, [peer]);
+
+  assertEqual(
+    follower.commitIndex,
+    1,
+    "follower adopts the leader's real commitIndex from leaderCommit over an actual HTTP round-trip",
+  );
+
+  await closeAll([server]);
+  leader.stop();
+  follower.stop();
+}
+
+// ==== AppendEntries route: leaderCommit flows through to the follower's commitIndex (Milestone 5, Step 5) ====
+
+{
+  const node = newNode("node-a"); // empty log, follower
+  const app = createRaftApp(node);
+  const res = await request(app)
+    .post("/raft/append-entries")
+    .send(
+      heartbeatBody({
+        entries: [{ term: 1, index: 1, command: { op: "put", key: "k", value: "v" } }],
+        leaderCommit: 1,
+      }),
+    );
+
+  assertEqual(res.body.success, true, "sanity: the request succeeds");
+  assertEqual(
+    node.commitIndex,
+    1,
+    "the append-entries route's real leaderCommit value flows through to the node's commitIndex, not a stubbed value",
+  );
+  node.stop();
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

@@ -217,6 +217,9 @@ returns `500`, since a plain `Error` has neither property.
 ## **Test coverage:** `test/api.test.ts`, 10/10 passing, including both the
 corrected 400 case and the still-correct 500 case side by side.
 
+### 4.4.10 — Test bug: node.test.ts's assertEqual used reference equality (Milestone 5, Step 4)
+node.test.ts's assertEqual checked actual === expected for its real pass/fail decision, while building its failure message with JSON.stringify(actual)/JSON.stringify(expected) for display only. For primitives the two agree, so this was invisible through Milestones 4 and 5, Steps 1–3 — every comparison in the file was a number, string, boolean, or null/undefined. Milestone 5, Step 4 was the first to compare real objects (LogEntry) directly, and 6 tests failed with a printed message showing identical-looking "expected X, got X" text, because two separately-constructed object literals with matching content are never ===-equal by reference, even though their stringified output matches exactly. Fixed by switching the real condition to the same JSON.stringify(actual) === JSON.stringify(expected) deep comparison already used in log.test.ts and rpc.test.ts, making all three test files consistent. Lesson: a test helper's displayed diff and its actual pass/fail condition can silently diverge — worth checking that a new test file's assertion helper does a real deep comparison before it's ever exercised with non-primitive values, rather than trusting it by extension from prior primitive-only usage.
+
 ## 5. Component 2: Raft Consensus
 
 ### 5.1 Scope for v1
@@ -244,9 +247,11 @@ Milestone 4 (leader election only, no log replication yet) implemented RequestVo
 
 `RaftLog` (`src/raft/log.ts`) is entirely in-memory — no persistence. A node's whole log is lost on crash/restart, unlike the storage engine's WAL-backed durability (§4.3). This is a real gap, not a non-issue: it means a restarted node currently cannot recover its log at all, which will need addressing (WAL-backed log persistence, or similar) before this project's failure-model tests in §6 (particularly #2 and #4) can be considered fully passing. Deferred for now; must be resolved before Milestone 5 is considered done.
 
-### 5.3.3 Leader-Side Replication Not Yet Safe Against Conflicting Follower Logs (Milestone 5, Step 3)
+### 5.3.3 Leader-Side Replication Safety — Resolved in Milestone 5, Step 4
 
 `AppendEntriesResponse` gained a `success: boolean` field this step, but the follower-side route (`rpc.ts`) returns `success: true` unconditionally — the real consistency check against `prevLogIndex`/`prevLogTerm` that could ever produce `false` doesn't exist until Milestone 5, Step 4. Consequently, the leader's `nextIndex`/`matchIndex` advancement (`RaftNode.advanceReplicationOnSuccess`) is exercised by real traffic, but the retreat-and-retry path (`retreatReplicationOnFailure`) is not — a follower with a genuinely conflicting log would today be reported as caught-up regardless. `nextIndex` is initialized optimistically per the Raft paper (`lastLogIndex + 1` at election time), which is correct behavior, but relies entirely on Step 4's consistency check to correct a wrong optimistic guess. Must be resolved by Step 4.
+
+Resolved in Milestone 5, Step 4: receiveAppendEntries() in node.ts now implements the real Raft consistency check against prevLogIndex/prevLogTerm, so the follower-side route genuinely returns success: false when a follower's log doesn't match — no longer unconditionally true. The leader's retreatReplicationOnFailure back-off path (previously dead code, only reachable in principle) is now exercised by real rejected responses. Verified via dedicated node.test.ts cases for the consistency check itself (missing entry, term mismatch, genuine conflict with truncation) and the explicitly-requested duplicate/retried-entry case (matching entries must not trigger truncation). Full Milestone 4/5 regression re-verified clean.
 
 ### 5.4 Client-facing RPC
 
@@ -382,6 +387,12 @@ safety silently breaks.
   36/36 `log.test.ts` (unchanged) + 84/84 `node.test.ts` + full
   `rpc.test.ts` clean + 3 repeated clean runs of the election
   integration test, zero orphaned processes. Done, tested, committed.
+
+  * ✅ **Step 4: Follower-side AppendEntries consistency check + real append** — (closes §5.3.3) — receiveAppendEntries() replaces receiveHeartbeat() entirely (an empty-entries[] AppendEntries already was a heartbeat, so keeping a separate pure method risked silent drift — same reasoning as removing setLastLogInfo() in Step 2). Implements the real Raft receiver algorithm: term checks, the prevLogIndex/prevLogTerm consistency check, and per-entry apply — truncate-and-replace on a genuine term conflict, skip without truncating when an entry already matches (duplicate/retried RPC), direct append past the log's end. AppendEntriesRequest/AppendEntriesResponse moved into node.ts as canonical types, mirroring VoteRequest/VoteResponse. 108/108 node.test.ts + 46/46 rpc.test.ts + 3 repeated clean election integration runs, zero orphaned processes. Done, tested, committed.
+  
+* ✅ **Step 5: commitIndex advancement** — RaftNode.recomputeCommitIndex() (leader-side) and real leaderCommit adoption in receiveAppendEntries() (follower-side). Deliberately commitIndex only — no lastApplied/state-machine application, which is Step 6's job; Raft separates "is this entry safe" from "has this entry been executed" on purpose. Leader-side advancement enforces the critical safety rule: only a current-term entry can trigger a new commitIndex advancement, even with a full majority on an older-term entry — covered by 4 dedicated test cases isolating this restriction specifically, per explicit request. 129/129 node.test.ts + 53/53 rpc.test.ts + 3 repeated clean election integration runs, zero orphaned processes. Done, tested, committed.
+
+**Milestone 5 core algorithm complete** — leader election, real log replication with conflict resolution, and commitIndex advancement with the term-matching safety restriction all implemented and verified. Known gap carried forward: §5.3.2's in-memory-only log (no persistence) remains open — must be resolved before Milestone 5 is considered fully done per that section's own closing note.
 
 6. Wire client writes through leader-only path with `421 NOT_LEADER` redirect.
 7. Run failure-model tests from Section 6, document results (including any that fail initially — document the fix, like your cousin did with the benchmark post. That's the most convincing part of a writeup).
