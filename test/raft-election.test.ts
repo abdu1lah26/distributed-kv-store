@@ -50,11 +50,12 @@ const mainTsPath = path.join(__dirname, "..", "src", "raft", "main.ts");
 interface NodeProcess {
   nodeId: string;
   port: number;
+  clientPort: number;
   child: ChildProcess;
   stdoutBuffer: string;
 }
 
-function spawnNode(nodeId: string, port: number, peers: string): NodeProcess {
+function spawnNode(nodeId: string, port: number, clientPort: number, peers: string): NodeProcess {
   // Spawn tsx's CLI directly via `node`, not `npx tsx` — avoids the
   // npx-wrapper orphan-process problem documented in §4.4.5.
   const child = spawn(process.execPath, [tsxCliPath, mainTsPath], {
@@ -62,6 +63,11 @@ function spawnNode(nodeId: string, port: number, peers: string): NodeProcess {
       ...process.env,
       NODE_ID: nodeId,
       PORT: String(port),
+      // Milestone 5, Step 6.1: CLIENT_PORT is now required by
+      // parseClusterConfig — without it, main.ts crashes immediately on
+      // "Missing required environment variable: CLIENT_PORT" before ever
+      // reaching the election logic this test exercises.
+      CLIENT_PORT: String(clientPort),
       PEERS: peers,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -70,7 +76,7 @@ function spawnNode(nodeId: string, port: number, peers: string): NodeProcess {
     detached: process.platform !== "win32",
   });
 
-  const proc: NodeProcess = { nodeId, port, child, stdoutBuffer: "" };
+  const proc: NodeProcess = { nodeId, port, clientPort, child, stdoutBuffer: "" };
 
   child.stdout?.on("data", (chunk: Buffer) => {
     proc.stdoutBuffer += chunk.toString();
@@ -156,12 +162,20 @@ async function main(): Promise<void> {
   const PORT_A = 5101;
   const PORT_B = 5102;
   const PORT_C = 5103;
+  const CLIENT_PORT_A = 5201;
+  const CLIENT_PORT_B = 5202;
+  const CLIENT_PORT_C = 5203;
 
   const peersFor = (self: "a" | "b" | "c"): string => {
+    // Milestone 5, Step 6.1: PEERS entries now require BOTH ports —
+    // "id=port:clientPort" — the old single-port shorthand this test
+    // used to build ("id=port") is no longer valid and would fail
+    // parseClusterConfig's own validation the same way a missing
+    // CLIENT_PORT env var does.
     const all: Record<"a" | "b" | "c", string> = {
-      a: `node-a=${PORT_A}`,
-      b: `node-b=${PORT_B}`,
-      c: `node-c=${PORT_C}`,
+      a: `node-a=${PORT_A}:${CLIENT_PORT_A}`,
+      b: `node-b=${PORT_B}:${CLIENT_PORT_B}`,
+      c: `node-c=${PORT_C}:${CLIENT_PORT_C}`,
     };
     return Object.entries(all)
       .filter(([id]) => id !== self)
@@ -171,9 +185,9 @@ async function main(): Promise<void> {
 
   // Spawn all 3 back-to-back, not staggered, per the person's finding —
   // no awaiting/delay between spawns.
-  const nodeA = spawnNode("node-a", PORT_A, peersFor("a"));
-  const nodeB = spawnNode("node-b", PORT_B, peersFor("b"));
-  const nodeC = spawnNode("node-c", PORT_C, peersFor("c"));
+  const nodeA = spawnNode("node-a", PORT_A, CLIENT_PORT_A, peersFor("a"));
+  const nodeB = spawnNode("node-b", PORT_B, CLIENT_PORT_B, peersFor("b"));
+  const nodeC = spawnNode("node-c", PORT_C, CLIENT_PORT_C, peersFor("c"));
   const allNodes = [nodeA, nodeB, nodeC];
 
   try {

@@ -44,6 +44,25 @@ function newNode(nodeId: string): RaftNode {
   return new RaftNode({ nodeId, randomFn: () => 0.5 });
 }
 
+// Grabs a real, currently-free port from the OS by briefly listening on
+// port 0 and closing immediately — same "let the OS pick" pattern used
+// for the Raft-RPC port throughout this file, used here to give a
+// PeerConfig a real (not fabricated) clientPort. Milestone 5, Step 6.1
+// added clientPort to PeerConfig; call sites that build a real,
+// reachable peer (as opposed to an intentionally-unreachable "ghost"
+// peer) use this rather than a made-up number.
+async function getEphemeralPort(): Promise<number> {
+  const tempServer = http.createServer();
+  await new Promise<void>((resolve) => tempServer.listen(0, "localhost", resolve));
+  const address = tempServer.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("Expected server.address() to return an AddressInfo.");
+  }
+  const port = address.port;
+  await new Promise<void>((resolve) => tempServer.close(() => resolve()));
+  return port;
+}
+
 // Spins up a real server for a RaftNode on an ephemeral port ("port 0"
 // lets the OS choose a free one, avoiding collisions between test runs
 // or with anything else running locally).
@@ -57,9 +76,15 @@ async function listen(
   if (address === null || typeof address === "string") {
     throw new Error("Expected server.address() to return an AddressInfo.");
   }
+  // clientPort (Milestone 5, Step 6.1) is a real, currently-free port —
+  // not dialed by anything in this file today (these tests only ever
+  // exercise the Raft-RPC port), but a real one is used anyway rather
+  // than a fabricated number, matching the pattern used for the real
+  // Raft-RPC port right above.
+  const clientPort = await getEphemeralPort();
   return {
     server,
-    peer: { id: node.nodeId, host: "localhost", port: address.port },
+    peer: { id: node.nodeId, host: "localhost", port: address.port, clientPort },
   };
 }
 
@@ -214,7 +239,7 @@ function closeAll(servers: http.Server[]): Promise<void[]> {
 {
   // Unreachable peer (nothing listening on this port) returns null, not a throw.
   const response = await requestVoteFromPeer(
-    { id: "ghost", host: "localhost", port: 1 }, // port 1 is reserved/unlikely to be listening
+    { id: "ghost", host: "localhost", port: 1, clientPort: 2 }, // port 1 is reserved/unlikely to be listening; clientPort is unused/unreachable — never dialed by this test
     { term: 1, candidateId: "node-b", lastLogIndex: 0, lastLogTerm: 0 },
   );
   assertEqual(
@@ -269,6 +294,7 @@ function closeAll(servers: http.Server[]): Promise<void[]> {
     id: "node-c",
     host: "localhost",
     port: 1,
+    clientPort: 2, // unused/unreachable — this peer is intentionally never dialed
   };
 
   await runElection(candidate, [peerB, unreachablePeer]);
@@ -289,8 +315,8 @@ function closeAll(servers: http.Server[]): Promise<void[]> {
 {
   const candidate = newNode("node-a");
   // Both peers unreachable: only the self-vote counts, 1/3 is not a majority.
-  const unreachableB: PeerConfig = { id: "node-b", host: "localhost", port: 1 };
-  const unreachableC: PeerConfig = { id: "node-c", host: "localhost", port: 2 };
+  const unreachableB: PeerConfig = { id: "node-b", host: "localhost", port: 1, clientPort: 2 }; // unused/unreachable
+  const unreachableC: PeerConfig = { id: "node-c", host: "localhost", port: 3, clientPort: 4 }; // unused/unreachable
 
   await runElection(candidate, [unreachableB, unreachableC]);
 
@@ -366,10 +392,12 @@ function closeAll(servers: http.Server[]): Promise<void[]> {
   if (address === null || typeof address === "string") {
     throw new Error("Expected server.address() to return an AddressInfo.");
   }
+  const peerBClientPort = await getEphemeralPort(); // real port, same reasoning as listen() — not dialed today, but not a fabricated number either
   const peerB: PeerConfig = {
     id: "node-b",
     host: "localhost",
     port: address.port,
+    clientPort: peerBClientPort,
   };
 
   const electionPromise = runElection(candidate, [peerB]);
@@ -575,7 +603,7 @@ function heartbeatBody(
 
 {
   const response = await sendHeartbeatToPeer(
-    { id: "ghost", host: "localhost", port: 1 },
+    { id: "ghost", host: "localhost", port: 1, clientPort: 2 }, // unused/unreachable
     heartbeatBody(),
   );
   assertEqual(
@@ -661,7 +689,7 @@ function heartbeatBody(
   leader.becomeCandidate();
   leader.becomeLeader(["ghost"]);
 
-  await sendHeartbeats(leader, [{ id: "ghost", host: "localhost", port: 1 }]);
+  await sendHeartbeats(leader, [{ id: "ghost", host: "localhost", port: 1, clientPort: 2 }]); // unused/unreachable
 
   assertEqual(
     leader.state,
@@ -743,7 +771,8 @@ function heartbeatBody(
   if (address === null || typeof address === "string") {
     throw new Error("Expected server.address() to return an AddressInfo.");
   }
-  const peer: PeerConfig = { id: "node-b", host: "localhost", port: address.port };
+  const capturedServerClientPort = await getEphemeralPort(); // real port, same reasoning as listen() — not dialed today, but not a fabricated number either
+  const peer: PeerConfig = { id: "node-b", host: "localhost", port: address.port, clientPort: capturedServerClientPort };
 
   await sendHeartbeats(leader, [peer]);
 
@@ -836,7 +865,7 @@ function heartbeatBody(
   leader.becomeLeader(["ghost"]);
   leader.log.append(1, { op: "put", key: "k", value: "v" });
 
-  await sendHeartbeats(leader, [{ id: "ghost", host: "localhost", port: 1 }]);
+  await sendHeartbeats(leader, [{ id: "ghost", host: "localhost", port: 1, clientPort: 2 }]); // unused/unreachable
 
   assertEqual(
     leader.commitIndex,
