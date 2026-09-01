@@ -1,5 +1,5 @@
 // Unit tests for src/raft/node.ts (Milestone 4, Step 1; updated Milestone
-// 5, Steps 1-5).
+// 5, Steps 1-5, 6.2).
 // Plain Node script, run via `npx tsx src/test/node.test.ts` — no test
 // framework, per this project's established convention (§9 / Milestone 2).
 
@@ -992,6 +992,132 @@ function heartbeat(term: number, leaderId: string): AppendEntriesRequest {
     leaderCommit: 0, // stale/reordered — must not regress the follower's commitIndex
   });
   assertEqual(node.commitIndex, 1, "a lower leaderCommit in a later request does not regress the follower's commitIndex");
+  node.stop();
+}
+
+// ---- currentLeaderId (Milestone 5, Step 6.2) ----
+{
+  const node = newNode("node-a");
+  assertEqual(node.currentLeaderId, null, "a fresh node has no known leader");
+  node.stop();
+}
+
+{
+  // A real AppendEntries that passes the term check sets currentLeaderId,
+  // even in the trivial case where this node was already a follower at
+  // the same term.
+  const node = newNode("node-a");
+  node.receiveAppendEntries(heartbeat(1, "node-b"));
+  assertEqual(node.currentLeaderId, "node-b", "receiveAppendEntries adopts the sender as the known leader");
+  node.stop();
+}
+
+{
+  // Adopted even when the AppendEntries also causes a step-down from
+  // candidate/leader (higher-term case).
+  const node = newNode("node-a");
+  node.becomeCandidate();
+  node.becomeLeader(["node-b"]);
+  assertEqual(node.currentLeaderId, "node-a", "sanity: a leader considers itself the leader");
+
+  node.receiveAppendEntries(heartbeat(5, "node-c"));
+  assertEqual(node.currentLeaderId, "node-c", "currentLeaderId updates to the new leader on a higher-term AppendEntries");
+  node.stop();
+}
+
+{
+  // currentLeaderId is adopted even when the request's CONSISTENCY CHECK
+  // fails (success: false) — the sender is still genuinely the leader,
+  // it just couldn't append this particular batch.
+  const node = newNode("node-a"); // empty log
+  const response = node.receiveAppendEntries({
+    term: 1,
+    leaderId: "node-b",
+    prevLogIndex: 5, // this follower has nothing here -> consistency check fails
+    prevLogTerm: 1,
+    entries: [],
+    leaderCommit: 0,
+  });
+  assertEqual(response.success, false, "sanity: the consistency check genuinely failed");
+  assertEqual(node.currentLeaderId, "node-b", "currentLeaderId is still adopted even when this particular AppendEntries is rejected");
+  node.stop();
+}
+
+{
+  // A STALE (lower-term) AppendEntries must NOT update currentLeaderId —
+  // it's rejected outright before the term check "passes".
+  const node = newNode("node-a");
+  node.becomeCandidate(); // term 1
+  node.becomeCandidate(); // term 2
+  const response = node.receiveAppendEntries(heartbeat(1, "node-stale"));
+  assertEqual(response.success, false, "sanity: the stale request is rejected");
+  assertEqual(node.currentLeaderId, null, "a stale (lower-term) AppendEntries does not update currentLeaderId");
+  node.stop();
+}
+
+{
+  // becomeCandidate() clears currentLeaderId — no leader is known during
+  // an election in progress, even if one was known before it started.
+  const node = newNode("node-a");
+  node.receiveAppendEntries(heartbeat(1, "node-b"));
+  assertEqual(node.currentLeaderId, "node-b", "sanity: a leader was known before the election");
+
+  node.becomeCandidate();
+  assertEqual(node.currentLeaderId, null, "becomeCandidate clears currentLeaderId");
+  node.stop();
+}
+
+{
+  // becomeLeader() sets currentLeaderId to self.
+  const node = newNode("node-a");
+  node.becomeCandidate();
+  node.becomeLeader(["node-b"]);
+  assertEqual(node.currentLeaderId, "node-a", "becomeLeader sets currentLeaderId to this node's own id");
+  node.stop();
+}
+
+{
+  // EXPLICITLY REQUESTED CASE: a RequestVote that causes this node to
+  // step down (via becomeFollower, seeing a higher term) must NOT be
+  // treated as evidence of a leader. A candidacy proves someone is
+  // running for leadership, not that they won — currentLeaderId stays
+  // stale/null in this window, which is correct per Raft's actual
+  // guarantees (a node genuinely doesn't know the new leader until that
+  // leader's own AppendEntries arrives), not a limitation of this
+  // implementation.
+  const node = newNode("node-a");
+  node.receiveAppendEntries(heartbeat(1, "node-old-leader"));
+  assertEqual(node.currentLeaderId, "node-old-leader", "sanity: a leader was known before the higher-term vote request");
+
+  const voteResponse = node.receiveVoteRequest(voteRequest(2, "node-candidate"));
+  assertEqual(voteResponse.term, 2, "sanity: the node stepped down to the higher term");
+  assertEqual(
+    node.currentLeaderId,
+    "node-old-leader",
+    "a RequestVote causing step-down does NOT update currentLeaderId — it's stale until a real AppendEntries from the actual (possibly different) new leader arrives, not updated to the candidate that merely requested a vote",
+  );
+  node.stop();
+}
+
+{
+  // Continuing the above scenario: once the real winner's AppendEntries
+  // arrives, currentLeaderId finally updates — demonstrating the window
+  // closes correctly, not just that it opens correctly.
+  const node = newNode("node-a");
+  node.receiveAppendEntries(heartbeat(1, "node-old-leader"));
+  node.receiveVoteRequest(voteRequest(2, "node-candidate"));
+  assertEqual(node.currentLeaderId, "node-old-leader", "sanity: still stale immediately after the vote request");
+
+  // The candidate that requested the vote goes on to win and sends a
+  // real AppendEntries — NOTE this need not even be the same node that
+  // requested the vote, illustrating why adopting the candidate directly
+  // would have been actively wrong.
+  node.receiveAppendEntries(heartbeat(2, "node-actual-winner"));
+  assertEqual(
+    node.currentLeaderId,
+    "node-actual-winner",
+    "currentLeaderId updates once a real AppendEntries from the actual winner arrives, closing the stale window",
+  );
   node.stop();
 }
 

@@ -1,28 +1,99 @@
-// Raft node entrypoint (Milestone 4, Step 5a).
+// Combined Raft node entrypoint (Milestone 5, Step 6.6).
 //
-// Parallel to src/index.ts (Milestone 3's REST API entrypoint): this is
-// the runnable process that wires together everything built so far —
-// cluster config (Step 2), the state machine (Step 1), and RPC wiring
-// (Steps 3-4) — into an actual bootable node.
+// Supersedes the Milestone 4 raft-only main.ts: this is the one real
+// process per node — owns the Store lifecycle, the RaftNode state
+// machine, the apply loop (Step 6.3), the leader-side write path
+// (Step 6.4), the Raft-RPC server (unchanged from Milestone 4, own
+// port), and the client-facing REST API (Step 6.5, its own port per
+// the two-port architecture locked in Step 6.1).
 //
 // Run with: npx tsx src/raft/main.ts
-// (or, once spawned by the Step 5b integration test, directly via node
-// against the resolved tsx CLI path, per the §4.4.5 orphan-process fix.)
+// (or, spawned by an integration test, directly via node against the
+// resolved tsx CLI path, per the §4.4.5 orphan-process fix.)
 
 import http from "node:http";
+import path from "node:path";
 import { RaftNode } from "./node.js";
 import { createRaftApp, runElection, sendHeartbeats } from "./rpc.js";
-import { parseClusterConfig } from "../cluster/config.js";
+import { parseClusterConfig, type PeerConfig } from "../cluster/config.js";
+import { Store } from "../storage/store.js";
+import { ApplyLoop } from "./applyLoop.js";
+import { proposeWrite } from "./writePath.js";
+import { createApp, type ClusterContext } from "../api/server.js";
+import type { LogCommand } from "./log.js";
+
+// Demo-tuned, same family as the existing 100ms peer-timeout / 50ms
+// heartbeat / 150-300ms election / 1000ms write-timeout constants — not
+// derived, chosen. Governs how quickly a FOLLOWER's local reads reflect
+// a newly-committed write (the leader's own writes are visible sooner,
+// via proposeWrite's immediate apply-on-commit — see below).
+const APPLY_POLL_INTERVAL_MS = 25;
 
 function logState(nodeId: string, term: number, state: string): void {
-  // Exact format locked with the person: [{nodeId}] term={n} state={state}
-  // — deliberately simple and greppable, since the Step 5b integration
-  // test polls stdout for this line rather than any richer structure.
+  // Exact format locked (unchanged since Milestone 4): [{nodeId}] term={n}
+  // state={state} — test/raft-election.test.ts polls stdout for exactly
+  // this line shape, so it must not change here.
   console.log(`[${nodeId}] term=${term} state=${state}`);
 }
 
-function main(): void {
+/**
+ * Builds the leaderRedirectHint() a ClusterContext exposes to the API
+ * layer, from this node's real currentLeaderId (Step 6.2) and the real
+ * cluster peer list (for the peer's clientPort — Step 6.1).
+ *
+ * Handles one non-obvious case explicitly: currentLeaderId can be
+ * STALE and point at THIS node's own id, if this node was leader and
+ * stepped down via a RequestVote (not an AppendEntries) — Step 6.2's
+ * currentLeaderId is deliberately only ever updated by a real
+ * AppendEntries, since a RequestVote proves candidacy, not victory (see
+ * node.ts's header comment). Naively returning "the leader is me" here
+ * while isLeader() is simultaneously false would be actively wrong, not
+ * just imprecise — treated as unknown (null) instead.
+ */
+function buildLeaderRedirectHint(
+  node: RaftNode,
+  peers: PeerConfig[],
+): { leaderId: string; url: string } | null {
+  const leaderId = node.currentLeaderId;
+
+  if (leaderId === null) {
+    return null;
+  }
+
+  if (leaderId === node.nodeId) {
+    // Stale self-belief from before stepping down via a vote request —
+    // see this function's doc comment above.
+    return null;
+  }
+
+  const peer = peers.find((p) => p.id === leaderId);
+  if (peer === undefined) {
+    // Shouldn't happen given config invariants (currentLeaderId always
+    // comes from a real leaderId on the wire, which must be either this
+    // node's own id or a configured peer's id) — defensive fallback
+    // rather than throwing, since this only affects a best-effort hint,
+    // not correctness of the underlying Raft state.
+    return null;
+  }
+
+  return { leaderId, url: `http://${peer.host}:${peer.clientPort}` };
+}
+
+async function main(): Promise<void> {
   const config = parseClusterConfig(process.env);
+
+  // Per-node data directory, scoped by nodeId so multiple nodes can run
+  // on the same machine (as in the integration tests) without colliding
+  // on the same WAL/SSTable files. Same "runtime default, not a design
+  // decision" reasoning as Milestone 3's index.ts DATA_DIR.
+  const dataDir = process.env.DATA_DIR ?? path.join(process.cwd(), "data", config.nodeId);
+  const walPath = process.env.WAL_PATH ?? path.join(dataDir, "wal.log");
+  const sstableDir = process.env.SSTABLE_DIR ?? path.join(dataDir, "sstables");
+
+  const store = new Store(walPath, sstableDir);
+  await store.open();
+
+  const applyLoop = new ApplyLoop(store);
 
   let lastLoggedState: string | null = null;
   let lastLoggedTerm: number | null = null;
@@ -38,12 +109,6 @@ function main(): void {
   const node = new RaftNode({
     nodeId: config.nodeId,
     onElectionTimeout: () => {
-      // Fire-and-forget: runElection is async, but the timer callback
-      // itself must stay synchronous. Errors are caught and logged
-      // rather than crashing the process — an unreachable peer during
-      // an election is expected/handled inside runElection itself, but
-      // this guards against any unexpected rejection (e.g. a thrown
-      // error from fetch in an unusual environment).
       runElection(node, config.peers)
         .then(() => logIfChanged(node))
         .catch((err) => {
@@ -63,30 +128,79 @@ function main(): void {
   // something to see even before the first election timeout fires.
   logIfChanged(node);
 
-  const app = createRaftApp(node);
-  const server = http.createServer(app);
+  // Periodically applies newly-committed entries to THIS node's own
+  // local Store — runs uniformly on leader AND follower, no branching,
+  // per DESIGN.md Section 3 ("each node's storage engine is fully
+  // independent... replication happens at the log entry level"). A
+  // leader that just committed a client write via proposeWrite already
+  // applied that specific entry immediately (see writePath.ts) — this
+  // interval is what makes FOLLOWERS ever apply anything at all, and
+  // also catches any commit progress made outside a direct client write
+  // (e.g. commitIndex advancing further on a later background heartbeat
+  // round). Re-applying an already-applied entry is a no-op (ApplyLoop
+  // tracks lastAppliedIndex itself, per Step 6.3), so overlap with
+  // proposeWrite's own apply call is harmless, not a double-apply bug.
+  //
+  // A failed apply is treated as fatal, per Step 6.3's design: it's a
+  // serious, unrecoverable state-divergence risk between nodes, not
+  // something to log-and-continue past — same "loud failure over silent
+  // ambiguity" principle held throughout this project.
+  const applyIntervalHandle = setInterval(() => {
+    applyLoop.applyCommitted(node).catch((err) => {
+      console.error(`[${config.nodeId}] FATAL: applyLoop.applyCommitted failed:`, err);
+      process.exit(1);
+    });
+  }, APPLY_POLL_INTERVAL_MS);
 
-  // Bind 0.0.0.0, not localhost: these are separate OS processes (in the
-  // Step 5b integration test, and eventually separate machines/containers
-  // per Milestone 8), so the listen address must be reachable from
-  // sibling processes, not just loopback-restricted.
-  server.listen(config.port, "0.0.0.0", () => {
+  const clusterContext: ClusterContext = {
+    isLeader: () => node.state === "leader",
+    leaderRedirectHint: () => buildLeaderRedirectHint(node, config.peers),
+    write: (command: LogCommand) => proposeWrite(node, config.peers, applyLoop, command),
+  };
+
+  const raftApp = createRaftApp(node);
+  const raftServer = http.createServer(raftApp);
+
+  const clientApp = createApp(store, clusterContext);
+  const clientServer = http.createServer(clientApp);
+
+  // Bind 0.0.0.0, not localhost: these are separate OS processes (in
+  // integration tests, and eventually separate machines/containers per
+  // Milestone 8), so both listen addresses must be reachable from
+  // sibling processes and real clients, not just loopback-restricted.
+  raftServer.listen(config.port, "0.0.0.0", () => {
     console.log(
-      `[${config.nodeId}] listening on 0.0.0.0:${config.port}, peers: ${config.peers
+      `[${config.nodeId}] raft RPC listening on 0.0.0.0:${config.port}, peers: ${config.peers
         .map((p) => `${p.id}=${p.host}:${p.port}`)
         .join(", ")}`,
     );
   });
 
-  function shutdown(): void {
+  clientServer.listen(config.clientPort, "0.0.0.0", () => {
+    console.log(`[${config.nodeId}] client API listening on 0.0.0.0:${config.clientPort}`);
+  });
+
+  function shutdown(signal: string): void {
+    console.log(`\n[${config.nodeId}] received ${signal}, shutting down...`);
     node.stop();
-    server.close(() => {
-      process.exit(0);
-    });
+    clearInterval(applyIntervalHandle);
+    raftServer.close();
+    clientServer.close();
+    store
+      .close()
+      .catch((err) => {
+        console.error(`[${config.nodeId}] error closing store during shutdown:`, err);
+      })
+      .finally(() => {
+        process.exit(0);
+      });
   }
 
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
 }
 
-main();
+main().catch((err) => {
+  console.error("Failed to start node:", err);
+  process.exit(1);
+});

@@ -38,6 +38,21 @@
 // advancement if it was created in the leader's current term — a leader
 // must never conclude an older-term entry is committed purely by
 // replica count (Raft paper §5.4.2).
+//
+// Milestone 5, Step 6.2: currentLeaderId tracking, for the eventual
+// 421 NOT_LEADER redirect hint (Section 3 / §5.4). Set ONLY from a real
+// AppendEntries that passes the term check (receiveAppendEntries) — a
+// RequestVote is deliberately NOT treated as evidence of a leader, since
+// it proves someone is running for leadership, not that they won;
+// adopting it would risk pointing a future redirect at a candidate who
+// goes on to lose the election. This means there is a real, expected
+// window — after stepping down (e.g. via receiveVoteRequest seeing a
+// higher term) but before hearing a real AppendEntries from the winner —
+// where currentLeaderId is stale or null. That is Raft's actual
+// guarantee, not a gap in this implementation: a node genuinely does not
+// know who the new leader is until that leader actually contacts it. Any
+// 421 redirect hint built from this field is therefore best-effort and
+// can legitimately be stale or absent in that window.
 
 import { RaftLog, type LogCommand, type LogEntry } from "./log.js";
 
@@ -114,6 +129,7 @@ export class RaftNode {
   private readonly _log: RaftLog;
   private _replicationState: Map<string, PeerReplicationState> = new Map();
   private _commitIndex: number = 0;
+  private _currentLeaderId: string | null = null;
 
   private electionTimer: NodeJS.Timeout | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
@@ -168,6 +184,19 @@ export class RaftNode {
    */
   get commitIndex(): number {
     return this._commitIndex;
+  }
+
+  /**
+   * This node's best current belief about who the cluster's leader is,
+   * for building a 421 NOT_LEADER redirect hint (Section 3 / §5.4). Only
+   * ever set from a real AppendEntries that passed the term check
+   * (receiveAppendEntries) — never from a RequestVote, and never merely
+   * from stepping down. See the Step 6.2 header comment above for why:
+   * this is a best-effort hint that can legitimately be stale or null,
+   * by Raft's actual guarantees, not a bug in this tracking.
+   */
+  get currentLeaderId(): string | null {
+    return this._currentLeaderId;
   }
 
   /**
@@ -232,6 +261,10 @@ export class RaftNode {
     this._state = "candidate";
     this._currentTerm += 1;
     this._votedFor = this.nodeId;
+    // No leader is known during an election in progress — a stale
+    // belief from the previous term would be actively wrong to keep
+    // (that leader, if it still exists, might not even win re-election).
+    this._currentLeaderId = null;
     this.resetElectionTimer();
   }
 
@@ -249,6 +282,7 @@ export class RaftNode {
    */
   becomeLeader(peerIds: string[]): void {
     this._state = "leader";
+    this._currentLeaderId = this.nodeId;
     if (this.electionTimer !== null) {
       clearTimeout(this.electionTimer);
       this.electionTimer = null;
@@ -431,6 +465,11 @@ export class RaftNode {
    *    candidate/leader, step down to follower (a legitimate leader for
    *    this term exists). Otherwise (already follower) just reset the
    *    election timer — this node continues recognizing the sender.
+   *    Also (Milestone 5, Step 6.2): once the term check above has
+   *    passed, this request is known to be from a real leader for a
+   *    term this node accepts, so currentLeaderId is adopted — even if
+   *    the consistency check below goes on to reject this particular
+   *    batch of entries, the sender is still genuinely the leader.
    * 4. Consistency check: if prevLogIndex > 0, this node's log must
    *    contain an entry at that index whose term matches prevLogTerm.
    *    prevLogIndex === 0 means "start of log," which is trivially
@@ -464,6 +503,15 @@ export class RaftNode {
     } else {
       this.resetElectionTimer();
     }
+
+    // Milestone 5, Step 6.2: this request passed the term check above
+    // (we didn't return early for a stale term), so it's a real
+    // AppendEntries from a real leader for a term this node accepts —
+    // adopt it as the known leader. Deliberately set here, not inside
+    // becomeFollower(), since becomeFollower() is also called from
+    // receiveVoteRequest() on a mere candidacy, which must NOT be
+    // treated as evidence of a leader (see header comment).
+    this._currentLeaderId = request.leaderId;
 
     if (request.prevLogIndex > 0) {
       const prevEntry = this._log.getEntry(request.prevLogIndex);

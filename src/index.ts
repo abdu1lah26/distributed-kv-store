@@ -1,13 +1,18 @@
 import path from "node:path";
 import { Store } from "./storage/store.js";
-import { createApp } from "./api/server.js";
+import { createApp, type ClusterContext } from "./api/server.js";
 
 /**
- * Real entrypoint for Milestone 3 (single-node REST API, no Raft yet —
- * DESIGN.md Section 7 item 3). Owns the Store lifecycle (open before
- * serving, close on shutdown) and the port binding — createApp() itself
- * stays free of both so it can be tested without a real socket
- * (see test/api.test.ts).
+ * Standalone single-node entrypoint (Milestone 3), predating Raft
+ * entirely. createApp() now requires a ClusterContext as of Milestone 5,
+ * Step 6.5 — this file satisfies it with a trivial always-leader,
+ * direct-to-Store context below, preserving this entrypoint's original
+ * single-node behavior exactly rather than dragging in a real Raft
+ * cluster it was never designed to have. Superseded by Milestone 5,
+ * Step 6.6's real combined entrypoint (src/raft/main.ts extended with a
+ * real RaftNode-backed ClusterContext) — this file is kept working in
+ * the meantime rather than left broken, since it's still a legitimate
+ * way to run a single unreplicated node.
  *
  * Data directory defaults to ./data relative to cwd (not specified in
  * DESIGN.md — this is a runtime default, not a design/scope decision,
@@ -24,7 +29,27 @@ async function main(): Promise<void> {
   const store = new Store(WAL_PATH, SSTABLE_DIR);
   await store.open();
 
-  const app = createApp(store);
+  // Trivial always-leader context: this node is the only node, so it's
+  // always "leader" and every write commits by definition (writes go
+  // straight to the local Store, no replication, no real Raft log —
+  // there's nothing to replicate to). index is not a real Raft log
+  // index in this mode (there is no Raft log here at all); it's a
+  // meaningless placeholder that a real ClusterContext (Step 6.6) would
+  // never actually produce this way.
+  const soloContext: ClusterContext = {
+    isLeader: () => true,
+    leaderRedirectHint: () => null,
+    write: async (command) => {
+      if (command.op === "put") {
+        await store.put(command.key, command.value);
+      } else {
+        await store.delete(command.key);
+      }
+      return { status: "committed", index: -1 };
+    },
+  };
+
+  const app = createApp(store, soloContext);
 
   const server = app.listen(PORT, () => {
     console.log(`KV store listening on http://localhost:${PORT}`);
