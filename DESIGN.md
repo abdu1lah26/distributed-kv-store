@@ -275,6 +275,134 @@ Write a test (script or manual) for each of these. This list IS the rubric for "
 3. **Network partition (minority side)** → minority side cannot elect a leader or accept writes (no split-brain).
 4. **Process crash + restart (WAL recovery)** → node rebuilds correct state from WAL alone.
 5. **Concurrent writes to leader** → correctly ordered in the log, applied in order on all nodes.
+### 6.1 Test #2 Results — Follower Crash + Rejoin (Milestone 6)
+
+**Result: PASS.** `test/raft-follower-crash.test.ts`, 40/40 across 3 runs.
+
+A single follower killed mid-cluster-life (never the leader) is
+correctly caught up after restart, including writes made entirely while
+it was down. Leadership never changes during this scenario — the kill
+of a follower does not, and should not, trigger any election.
+
+**Important caveat, stated explicitly so this result is never
+mistaken for more than it proves:** this passes via **replication**,
+not **persistence**. The restarted follower comes back with a
+completely empty in-memory `RaftLog` (§5.3.2's gap is real and
+unaffected by this result) — the leader's existing §5.3.3 consistency
+check simply treats it like any other far-behind follower and streams
+the missing entries forward. A single node crashing while a majority
+survives can never, by construction, distinguish "recovered from disk"
+from "recovered from a peer who never lost their copy." This is a
+correct and useful thing to have proven, but it is not evidence that
+§5.3.2 is resolved. See §6.2 below for the test that actually removes
+that safety net.
+
+Found and fixed one real, previously latent bug along the way: the
+shared `pollUntil()` test helper (used across all three multi-process
+integration test files) called its predicate with no error handling.
+Every predicate in this project is `fetch`-based, and `fetch` **throws**
+(`ECONNREFUSED`) rather than resolving `false` when the target isn't
+listening yet — which this test was the first to actually exercise,
+by polling a node mid-restart. Fixed by wrapping the predicate call in
+`pollUntil` in try/catch and treating any thrown error as "not ready
+yet, keep polling," not a test failure. Patched in both
+`raft-follower-crash.test.ts` and, for consistency (per this project's
+"hasn't failed yet is not an excuse" principle), the pre-existing copy
+in `raft-write-path.test.ts` — the latter had the identical bug but had
+never hit it, purely because its existing predicates happened to only
+ever target already-up nodes. Full `raft-write-path.test.ts` regression
+(35/35, 3 runs) confirmed the fix changed nothing else.
+
+### 6.2 Test #4 Results — Process Crash + Restart (Milestone 6)
+
+**File:** `test/raft-full-crash.test.ts`, two parts.
+
+**Part A (partial crash — leader + one follower killed together,
+both restarted): PASS**, 3 runs clean. New coverage vs §6.1: forces
+re-election from a down-to-1-of-3 minority (the lone survivor correctly
+cannot elect itself, consistent with test #3's expected finding) and a
+simultaneous two-node restart. Its persistence conclusion is still
+"recovers via replication" — the one survivor never lost its copy of
+the log. Useful stress test; not itself evidence for or against §5.3.2.
+
+**Part B (full-cluster simultaneous crash — the honest test): PASS**,
+36/36 across 3 runs, and this is the first result in this project that
+is a **genuine, previously-undocumented failure mode being proven and
+accepted**, not a bug to be fixed. Both halves of §5.3.2's real-world
+consequence were proven separately, deliberately, so neither
+overstates nor understates what actually happens:
+
+* **(a) Entries applied to a node's local `Store` before the crash DO
+  survive** a full simultaneous restart of all 3 nodes — via that
+  node's own WAL (§4.3), which is completely independent of, and
+  unaffected by, the Raft layer's lack of persistence. Proven directly,
+  not assumed.
+* **(b) Entries that were committed-but-not-yet-applied, or
+  appended-but-never-committed, at the moment of a full-cluster crash
+  are genuinely, provably gone** — no node, at either the Raft layer or
+  the storage layer, retains any record of them. This is §5.3.2 made
+  concrete: the in-memory-only `RaftLog` has nothing to replay from
+  when every node's memory is wiped simultaneously, and unlike the KV
+  `Store`, there is no WAL underneath it to fall back on.
+
+**Documented dead end — the first attempt at proving (b), and why it
+initially gave the wrong (too optimistic) result:**
+
+The first version of this test fired a write via the client API without
+awaiting it, then immediately killed all 3 node processes together,
+expecting to land in the appended-but-uncommitted window before the
+write could complete. This **failed consistently across all 3 runs** —
+the uncommitted key was found to have fully survived, on every node,
+every run. Root cause, confirmed by inspection rather than assumed:
+`killNode()`'s real wall-clock cost (spawning `taskkill` as a separate
+process on Windows, or awaiting a genuine `exit` event on either
+platform) is not instant — plausibly tens of milliseconds — while the
+full write path on a healthy, all-local 3-node cluster (append to the
+leader's in-memory log, `AppendEntries` round-trip to 2 loopback peers,
+majority reached, `commitIndex` advanced, applied immediately per
+Milestone 5 Step 6.4) can complete in low single-digit milliseconds.
+The write was never actually racing the kill signal — it was finishing
+first, every time, simply because everyone involved was still alive and
+fast enough to win. "Fire without awaiting" only produces a genuine race
+if the thing being raced against can plausibly still lose.
+
+**Fix, and the actual technique used:** rather than trying to time the
+race more precisely (which cannot be made deterministic from a black-box
+test with no debug endpoint — a deliberate standing constraint on this
+project's tests, same reasoning as never exposing internal Raft state
+over HTTP), the test instead **removes the possibility of commit
+entirely**. Both followers are killed and their exit is genuinely
+confirmed *first*. With no live followers, the leader is *structurally*
+incapable of reaching a majority for the next entry, regardless of how
+fast it is — this is a guarantee, not a timing bet. The write is then
+fired against the now-isolated leader, given a short fixed 100ms window
+to append to its own in-memory log (ample margin for a purely local,
+synchronous operation — not a race against anything, since commit is
+already impossible), and the leader is killed before its own 1000ms
+write-timeout could elapse. This produced the correct, honest,
+deterministic result on the first working run and held across all 3.
+
+**Conclusion:** §5.3.2 remains an open, real gap, now backed by a
+concrete, reproducible, honestly-obtained test result rather than a
+prediction. Resolving it (WAL-backed `RaftLog` persistence, or an
+equivalent mechanism) remains necessary before either of these two
+failure-model tests — and the broader claim that this system tolerates
+process crashes — can be considered fully satisfied in the strict sense
+the project set out to demonstrate. `test/raft-follower-crash.test.ts`
+and `test/raft-full-crash.test.ts` Part A show the system degrades
+gracefully via replication whenever any majority survives; `test/
+raft-full-crash.test.ts` Part B shows precisely, and honestly, where
+that stops being true.
+
+**Tracked cleanup item (not yet fixed):** `raft-election.test.ts`,
+`raft-write-path.test.ts`, and `raft-follower-crash.test.ts` all rely on
+`main.ts`'s default `DATA_DIR` (`./data/<nodeId>`, cwd-relative) rather
+than an isolated temp directory per run. Harmless so far, since none of
+them assert on precise on-disk state — `raft-full-crash.test.ts` is the
+first test to need that guarantee, and is the only one currently using
+`mkdtemp`-isolated per-node data directories. Should be retrofitted to
+the other three the next time any test needs to make a real assertion
+about on-disk state.
 
 ---
 

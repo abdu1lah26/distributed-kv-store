@@ -152,7 +152,23 @@ async function pollUntil(
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (await predicate()) {
+    // A predicate built on fetch() (as every use in this file is) can
+    // THROW rather than resolve false when the target isn't listening
+    // yet (e.g. ECONNREFUSED). Found as a real bug while building
+    // raft-follower-crash.test.ts, which restarts a node mid-test and
+    // hit this directly. This file's current predicates only ever
+    // target already-up nodes, so it hasn't been hit here yet — but
+    // that was incidental, not a guaranteed property of this helper,
+    // so the same fix applies here for consistency: swallowed and
+    // retried, not left to crash the whole test. Only the timeout is a
+    // genuine failure signal.
+    let result: boolean;
+    try {
+      result = await predicate();
+    } catch {
+      result = false;
+    }
+    if (result) {
       return true;
     }
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
