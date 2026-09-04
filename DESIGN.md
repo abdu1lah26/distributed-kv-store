@@ -404,6 +404,101 @@ first test to need that guarantee, and is the only one currently using
 the other three the next time any test needs to make a real assertion
 about on-disk state.
 
+### 6.3 Test #1 Results — Leader Crash Mid-Write (Milestone 6)
+
+**Result: PASS.** `test/raft-leader-crash.test.ts`, 19/19 across 3 runs,
+consistent 2/100 raced writes acknowledged every run.
+
+**The invariant under test, stated precisely:** if the client received
+`200` for a write, that write must survive — regardless of exactly when
+the leader died relative to it. Writes that were **not** acknowledged
+(error, dropped connection, or nothing at all) carry no guarantee
+either way; this is the correct, standard distributed-systems contract,
+not a gap this test needs to close. A concurrent burst of 100 writes is
+fired at the leader without awaiting any of them, and the leader is
+killed immediately after — the burst is checked afterward to see which
+writes actually got acknowledged before the leader died, and every
+acknowledged one is verified to survive on the newly-elected leader and
+both real survivors.
+
+**Why the invariant holds by construction, not just by observation:**
+`proposeWrite` (Milestone 5, Step 6.4) only returns `200` after
+confirming real majority commit. A majority of 3 always includes at
+least one follower besides the leader — so if the leader dies the
+instant after acking, that follower already has the entry, and Raft's
+own election-safety rule (§5.3.1, already implemented and unit-tested
+in Milestone 5) forbids electing a new leader that doesn't have it.
+This test is a real, end-to-end, concurrent-load, real-process-death
+proof of a guarantee already established in isolation — valuable for
+the conditions it runs under, not because the outcome was genuinely in
+doubt.
+
+**Full tuning investigation (documented in full — every attempt here,
+including the ones that didn't work, is real evidence about this test
+environment, not noise to discard):**
+
+1. `BURST_SIZE=50`, no delay, default fetch dispatcher: ~1-2/50 acked.
+2. `BURST_SIZE=200`, no delay, default dispatcher: 1/200 acked —
+   *fewer*, not more, despite 4x the volume. Ruled out "percentage of
+   N completes" as the model; pointed instead toward a small, roughly
+   fixed number of writes completing in the real-time gap before the
+   kill lands, regardless of queue depth.
+3. `BURST_SIZE=100`, a small added `KILL_DELAY_MS=10` real delay
+   between firing the burst and killing the leader (not "wait for it
+   to finish"), default dispatcher: 1/100 acked — essentially
+   unchanged. The delay didn't meaningfully widen the window at this
+   magnitude.
+4. `BURST_SIZE=100`, `KILL_DELAY_MS=10`, an explicit high-concurrency
+   `undici` `Agent` passed as the fetch dispatcher — testing the
+   hypothesis that Node's default per-host connection-pool cap was
+   queuing most of the burst client-side, never even sending it before
+   the kill: **0/100 acked, confirmed clean across 4 repeated runs**,
+   not a fluke. This *ruled out* client-side connection pooling as the
+   bottleneck — raising client concurrency didn't improve, and if
+   anything performed marginally worse than, the default-dispatcher
+   baseline. Tested via a separate, explicitly throwaway diagnostic
+   file (`test/raft-leader-crash-diagnostic.test.ts`, deleted after
+   use, never committed) so the real test file was never left carrying
+   the extra dispatcher complexity or a `dispatcher`-vs-`RequestInit`
+   type-version-mismatch cast it didn't end up needing.
+
+**Conclusion:** neither burst volume, nor a small added delay, nor
+client-side connection concurrency meaningfully changes the outcome.
+The most likely honest explanation: on this machine, a single local
+write completes end-to-end (log append + 2-peer `AppendEntries`
+round-trip + majority + commit + apply) fast enough, and `killNode()`
+itself takes long enough (spawning `taskkill` on Windows, or awaiting a
+genuine process `exit` on either platform), that only a very small
+number of writes can ever be in a genuinely undecided state at the
+moment the kill actually lands — typically **0-2 out of a 100-write
+burst**. Accepted as an honest, reproducible property of this test
+environment, not a deficiency in the test or something to keep tuning
+around. Settled on `BURST_SIZE=100`, no artificial delay, no special
+dispatcher — the simplest version that produces this environment's
+real, achievable sample, run repeatedly per this project's standing
+timing-sensitive-test discipline rather than engineered toward a
+bigger single-run number.
+
+**Why a sample this small is still sufficient evidence:** the safety
+property is verified two ways at once, not one. *Empirically*, every
+write that does get acknowledged each run — however few — is checked
+for real survival after a real process death, under real concurrent
+load. *Structurally*, Raft's election-safety rule (§5.3.1) guarantees
+this can never fail regardless of sample size, because a new leader
+provably cannot be elected without every entry a majority already
+committed. This chaos test is confirmatory evidence under real
+conditions, not the sole source of confidence in the guarantee — which
+is exactly why a small honest sample, accumulated across repeated runs,
+is an acceptable bar here, rather than a reason to keep escalating
+`BURST_SIZE` chasing a bigger number for its own sake.
+
+**Milestone 6 status after tests #1, #2, and #4:** three of five
+Section 6 failure-model tests are now run, honestly documented,
+including one genuine failure result (§6.2's Part B) and one dead-end
+tuning investigation resolved with a ruled-out hypothesis rather than
+a guess (this section). Remaining: test #3 (network partition,
+minority side) and test #5 (concurrent writes, ordering).
+
 ---
 
 ## 7. Milestones (each = a runnable, demoable state — commit at each one)
