@@ -499,6 +499,65 @@ tuning investigation resolved with a ruled-out hypothesis rather than
 a guess (this section). Remaining: test #3 (network partition,
 minority side) and test #5 (concurrent writes, ordering).
 
+### 6.4 Test #3 Results — Network Partition, Minority Side (Milestone 6)
+
+**Result: PASS.** `test/raft-partition.test.ts`, 18/18 across 3 runs.
+Worked as designed on the first real attempt — no tuning detour needed
+here, unlike test #1 (§6.3).
+
+**What this test proves that §6.2 didn't:** §6.2 Part A killed 2 of 3
+processes outright — process *death*, not a network *partition*. A
+killed process can't do anything, not even hold a stale belief that
+it's still leader. A partitioned node stays alive: its Raft state
+machine keeps running, and if it was the leader when the partition
+happened, nothing *forces* it to notice on its own. This test isolates
+the actual elected leader mid-cluster-life — still running, cut off
+only from its peers, never from a real client — and checks the one
+question §6.2 never touched: can an isolated leader be tricked into
+telling a client a write succeeded when it structurally cannot have
+reached majority?
+
+**Mechanism:** a thin TCP passthrough proxy layer (plain `node:net`,
+no HTTP-awareness) sits in front of every directed inter-node Raft-RPC
+link — 6 proxies total, since each direction is logically separate
+outgoing traffic. All 6 are built up front, covering every node as a
+possible isolation target, since which node wins the initial election
+isn't controlled by the test (retrying spawns until a specific node
+won was explicitly rejected as a source of hidden flakiness). Once the
+real leader is known, only the 4 proxies touching it are closed —
+closing both stops new connections *and* forcibly destroys any
+already-live piped sockets, so a pre-existing keep-alive connection
+can't quietly keep working through an already-open pipe. Client-facing
+ports were never proxied; only inter-node RPC is ever cut, matching a
+real partition.
+
+**Core result:** the isolated leader's write attempt never returned
+`200`. Every run, it returned a real `503 WRITE_TIMEOUT` — the
+expected shape per §6.5, since the isolated node's own client API was
+never cut off, only its ability to reach a majority. `proposeWrite`'s
+1000ms internal timeout fired honestly rather than the node hanging or
+guessing. Logged as a diagnostic every run regardless (same
+transparency habit as test #1's ack/no-ack split), even though the
+hard assertion only required "not 200," not that specific code.
+
+Also confirmed: the 2-node majority side detected the silence, elected
+a new leader, and kept accepting and converging writes; the isolated
+node never received anything committed on the majority side while cut
+off; the rejected write itself was absent everywhere, including on the
+isolated node's own local state — it never got far enough to persist,
+let alone commit.
+
+**Incidental note, not a bug:** the same node (`node-b`) won the
+election in all 3 runs this session — an artifact of the randomized
+election timers landing that way, not a sign the dynamic
+whoever-wins-gets-isolated logic only works for one node. The mechanism
+isolates whichever node the stdout-polling identifies as leader,
+regardless of identity; it simply kept being the same one this session.
+
+**Milestone 6 status after tests #1, #2, #3, and #4:** four of five
+Section 6 failure-model tests are now run and honestly documented.
+Remaining: test #5 (concurrent writes, ordering).
+
 ---
 
 ## 7. Milestones (each = a runnable, demoable state — commit at each one)
