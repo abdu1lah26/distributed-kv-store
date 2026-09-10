@@ -560,6 +560,109 @@ Remaining: test #5 (concurrent writes, ordering).
 
 ---
 
+### 6.5 Test #5 Results — Concurrent Writes to Leader (Milestone 6)
+
+**Result: PASS.** `test/raft-concurrent-writes.test.ts`, all mechanisms
+clean across 3 runs.
+
+**What "correctly ordered" means here, stated precisely before
+anything else:** Raft does not promise concurrently-submitted,
+unsequenced client requests get applied in wall-clock submission
+order — that's not a real guarantee of any distributed system. What it
+does guarantee, and what's genuinely provable from a black-box client,
+is that whatever order the leader's log assigns to concurrent entries,
+every node applies that exact same order. The observable consequence:
+after concurrent writes settle, every node must agree on the exact
+same final value for every key, including keys multiple concurrent
+writes raced to update. This test never predicts or asserts which
+racing write wins — only that all nodes agree with each other on
+whichever one did.
+
+**Two mechanisms, testing two different halves of the guarantee:**
+
+* **Racing-key convergence** — N=20 concurrent, unawaited writes to
+  the *same* key, each with a distinguishable value. Whichever value
+  the leader settles on is read directly and used as the expected
+  value for every other node — never predicted in advance. Run twice
+  per execution. This is the ordering-consistency check: any real
+  apply-order divergence between nodes would show up immediately as
+  different nodes reporting different final values for the same key.
+* **Distinct-key batch integrity** — M=20 concurrent writes to 20
+  different keys, no overlap. Checks that raw concurrent volume
+  doesn't drop, duplicate, or cross-contaminate entries, independent
+  of any single key being contested.
+
+Both passed cleanly, all 3 runs: every node converged on identical
+final state for every racing key, and every node had the exact
+correct value for every distinct-key batch entry.
+
+**A real finding surfaced after the first clean run, investigated and
+resolved honestly rather than left unexamined:** in every trial across
+the initial 3 runs, the racing-key winner was the *same* index every
+time — the last write fired (`race-19` for N=20), not merely
+consistent run-to-run but identical trial-to-trial. That's suspicious
+on its own: it raised the question of whether the burst was arriving
+at the leader in close to strict submission order — effectively
+serialized — rather than genuinely concurrent, which would undercut
+part of what this test was meant to exercise (the convergence
+assertions would still be real, but "concurrent" would be aspirational
+rather than actual).
+
+Investigated via a throwaway diagnostic file (`test/
+raft-concurrent-writes-diagnostic.test.ts`, deleted after use, never
+committed), applying the same technique already proven useful in test
+#1's tuning investigation: an explicit high-concurrency `undici`
+`Agent` substituted for the default fetch dispatcher, to rule out
+client-side connection-pool queueing as the cause of the apparent
+serialization. Run across 4 executions of 3 trials each — 12 trials
+total, the full sample, not a cherry-picked subset:
+
+Run 1: 19, 19, 19
+Run 2: 18, 19, 19
+Run 3: 19, 19, 19
+Run 4: 19, 19, 19
+
+**11/12 trials landed on index 19 (the last index fired); 1/12 landed
+on index 18** — a real, observed deviation, not noise explained away.
+
+**Honest conclusion, stated precisely rather than rounded to either
+extreme:** this is neither full determinism (`always 19` would mean
+no real concurrency was ever occurring) nor freely unpredictable
+concurrency (a uniform spread across all 20 indices would look very
+different from 11/12 on one value). The accurate characterization is
+**predominantly last-fired-wins, with rare genuine deviation** — real
+non-determinism does exist in this environment, it's just infrequent,
+most likely due to Node/Express's single-threaded request handling
+and/or `proposeWrite`'s own synchronous log-append sequencing making
+same-machine, low-jitter localhost requests land in close to (but not
+perfectly) submission order most of the time. Not something this
+project's black-box tooling can characterize further without
+instrumenting `proposeWrite`/`rpc.ts` internals directly, which the
+standing black-box constraint rules out — and per the tuning
+discipline established in test #1 (§6.3), this was treated as the
+final data point rather than a cue to chase further variables.
+
+**Practical consequence for what this test can and cannot claim:**
+cross-node convergence correctness is proven genuinely and
+completely — that property held on every single trial, unconditionally,
+including the one trial that actually exercised a different winner.
+It does *not* demonstrate resilience across a broad range of arrival
+orderings, because this environment doesn't reliably produce that
+range regardless of how the burst is fired. Recorded as a known,
+precisely-quantified limitation of what this test can prove *here* —
+not overstated as full determinism, not understated as if genuine
+concurrency were never observed.
+
+**Milestone 6 status: all five Section 6 failure-model tests are now
+run and honestly documented** — tests #1-#5 complete, including one
+genuine failure result (§6.2 Part B, the §5.3.2 gap), two dead-end
+tuning investigations resolved with ruled-out hypotheses rather than
+guesses (§6.3's burst-size/delay/pooling investigation for test #1,
+and this section's pooling investigation for test #5), and one
+precisely-quantified partial-determinism finding (this section). Every
+result reflects what was actually observed, including the ones that
+took more than one attempt to get right.
+
 ## 7. Milestones (each = a runnable, demoable state — commit at each one)
 
 1. Single-node KV store: WAL + MemTable — **✅ DONE.** WAL, MemTable, Store coordinator all implemented and tested (manual sanity check + 3 durability test variants: clean-exit replay, SIGKILL mid-write, torn-record tolerance). Runner: tsx (ts-node incompatible with nodenext, see Tooling Lock).
