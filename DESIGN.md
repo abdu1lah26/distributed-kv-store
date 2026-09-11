@@ -794,6 +794,74 @@ Milestone 5 complete — the full Raft consensus layer (leader election, log rep
 8. Docker Compose for the 3-node cluster, README with `docker compose up`.
 9. (Stretch, optional) Simple dashboard or CLI showing cluster state.
 
+### 7.1 Docker Compose Verification — Milestone 7, Section 7 Item 8
+
+**Result: PASS.** `docker compose up --build`, 3 real containers,
+verified end to end.
+
+**Files added:** `Dockerfile` (single image, `node:22`, reused across
+all 3 services — nodes differ only by env vars at compose time, not by
+image), `docker-compose.yml` (3 services on a shared bridge network,
+asymmetric volumes — see below), `.dockerignore`, `README.md`.
+
+**Volume design, deliberate and honest about §5.3.2:** only each
+node's `DATA_DIR` (KV Store's WAL + SSTables) is volume-mounted. The
+Raft log is in-memory only and has nothing to mount — `docker-
+compose.yml` does not create a volume for it, so a container restart
+can't misleadingly appear to "remember" Raft state it never actually
+persisted. This mirrors, at the infra layer, the same honesty already
+established in §6.2's failure-model test.
+
+**Port exposure:** only the 3 client-API ports (5001-5003) are
+published to the host; Raft-RPC ports (4001-4003) stay internal to the
+Docker network — matches the real deployment shape (a client never
+needs direct access to inter-node RPC).
+
+**Verified directly, not just assumed from config correctness:**
+
+* `docker compose logs -f` shows real leader election happening across
+  3 separate containers — term changes and `state=leader` visible on
+  exactly one node at a time, same log-line contract as the bare-metal
+  integration tests (§6).
+* `docker compose stop node-c && docker compose start node-c` — clean
+  stop/start, node rejoins without issue.
+* `docker compose down` — clean teardown, no leftover error noise from
+  `npm install` on rebuild (an earlier attempt had noise here; resolved
+  by installing full `devDependencies`, since `tsx`/`typescript` are
+  both dev deps and this project has no compile step — see Dockerfile
+  comment).
+* **Full write path, real containers:** `PUT` against the real leader's
+  host-published port (`localhost:5002`) returned `200`; both followers
+  (`localhost:5001`, `localhost:5003`) independently queried immediately
+  after show the identical replicated value. Genuine cross-container
+  write → replicate → read verified, not inferred from the code alone.
+* `421` responses from non-leader nodes consistently carry the correct
+  `leaderId` and a structurally well-formed `leaderHint` URL, every
+  time, across repeated attempts.
+
+**Real finding — `leaderHint` uses Docker-internal hostnames, not
+host-visible ones (not a bug, but genuinely easy to trip over):**
+`leaderRedirectHint()` (§ Step 6.2/6.6) builds its hint from the
+`PEERS` config, which — inside `docker-compose.yml` — correctly uses
+Docker's internal service DNS names (e.g. `node-b`) so containers can
+reach each other. This is the right behavior for an in-cluster client.
+But it means a `421`'s `leaderHint` (e.g. `http://node-b:5002`) is
+**not resolvable from a host-machine `curl`** — `node-b` only exists as
+a hostname inside the Docker network. A reader following the README's
+own curl examples and then naively following a returned `leaderHint`
+would hit a DNS failure that has nothing to do with the cluster being
+broken. Documented explicitly in `README.md` with a translate-node-id-
+to-published-port worked example, rather than leaving a reader to
+discover and debug this themselves. Not treated as a code fix, since
+the hint's actual audience (in-cluster clients, and Milestone 9's
+possible dashboard/CLI if it runs inside the network) needs exactly
+the internal hostname it already returns — this is a host-vs-container
+network-boundary fact worth documenting, not a defect to patch around.
+
+**Status:** Section 7 item 8 (Docker Compose) complete. Remaining open
+items: §5.3.2 (Raft log persistence, still deliberately unresolved —
+Docker layer does not mask it, per above) and Section 7 item 9
+(stretch, optional dashboard/CLI).
 ---
 
 ## 8. Architecture Decision Records (ADRs)
