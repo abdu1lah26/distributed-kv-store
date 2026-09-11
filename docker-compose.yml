@@ -1,0 +1,77 @@
+# 3-node Raft cluster. All 3 services build from the same Dockerfile;
+# they differ only in NODE_ID/PORT/CLIENT_PORT/PEERS/DATA_DIR, exactly
+# mirroring how you'd run 3 separate `tsx src/raft/main.ts` processes
+# locally with different env vars.
+#
+# PEERS uses each OTHER service's Compose service name as the host
+# (Docker's embedded DNS resolves "node-b" etc. within the shared
+# network below) — same "id=host:port:clientPort" format config.ts
+# already parses, just with a real hostname instead of "localhost".
+#
+# Volumes are DELIBERATELY asymmetric — see DESIGN.md §5.3.2. Only each
+# node's DATA_DIR (the KV Store's WAL + SSTables, real durability per
+# §4.3) is volume-mounted. The Raft log itself is in-memory only and
+# has nothing to mount; that gap is real and this file does not paper
+# over it. See README.md for the explicit callout.
+#
+# Only CLIENT_PORTs are published to the host, matching the real
+# deployment shape: a curl client needs the client API, never direct
+# access to inter-node Raft-RPC traffic.
+
+services:
+  node-a:
+    build: .
+    container_name: kv-node-a
+    environment:
+      NODE_ID: node-a
+      PORT: "4001"
+      CLIENT_PORT: "5001"
+      DATA_DIR: /app/data/node-a
+      PEERS: node-b=node-b:4002:5002,node-c=node-c:4003:5003
+    volumes:
+      - node-a-data:/app/data/node-a
+    ports:
+      - "5001:5001"
+    networks:
+      - kvnet
+
+  node-b:
+    build: .
+    container_name: kv-node-b
+    environment:
+      NODE_ID: node-b
+      PORT: "4002"
+      CLIENT_PORT: "5002"
+      DATA_DIR: /app/data/node-b
+      PEERS: node-a=node-a:4001:5001,node-c=node-c:4003:5003
+    volumes:
+      - node-b-data:/app/data/node-b
+    ports:
+      - "5002:5002"
+    networks:
+      - kvnet
+
+  node-c:
+    build: .
+    container_name: kv-node-c
+    environment:
+      NODE_ID: node-c
+      PORT: "4003"
+      CLIENT_PORT: "5003"
+      DATA_DIR: /app/data/node-c
+      PEERS: node-a=node-a:4001:5001,node-b=node-b:4002:5002
+    volumes:
+      - node-c-data:/app/data/node-c
+    ports:
+      - "5003:5003"
+    networks:
+      - kvnet
+
+volumes:
+  node-a-data:
+  node-b-data:
+  node-c-data:
+
+networks:
+  kvnet:
+    driver: bridge
