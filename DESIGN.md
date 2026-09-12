@@ -864,6 +864,158 @@ Docker layer does not mask it, per above) and Section 7 item 9
 (stretch, optional dashboard/CLI).
 ---
 
+## 7.9 Dashboard — Live Cluster State (Milestone 9, stretch)
+
+### 7.9.1 `/status` endpoint
+
+New route `GET /status` on the **client-API Express app** (`createApp`'s
+app, `server.ts`) — sibling to `/kv/:key`, not part of the `/kv`
+namespace, and not on the Raft-RPC app. Rationale: `/status` is a
+read-only, client-facing concern (same audience as `GET /kv/:key`), not
+inter-node RPC traffic.
+
+Response shape:
+
+```json
+{
+  "nodeId": "node-a",
+  "state": "leader",
+  "currentTerm": 4,
+  "commitIndex": 12,
+  "lastApplied": 12,
+  "currentLeaderId": "node-a"
+}
+```
+
+`lastApplied` included alongside `commitIndex` deliberately — Raft
+separates "is this entry safe" from "has this entry been executed"
+(§Step 6.3), and collapsing the two on the dashboard would misrepresent
+that distinction the rest of this project has been careful about.
+
+**⚠️ Unverified against real source, must confirm before implementation:**
+`commitIndex` is assumed to be a public field/getter on `RaftNode`, and
+`lastApplied` a public field/getter on `ApplyLoop`. Neither `node.ts`
+nor `applyLoop.ts` has been checked directly — only DESIGN.md's prose
+description of Step 5 / Step 6.3. Per this project's own drift-catching
+precedent (§4.4.2), these must be confirmed against the actual files,
+not assumed from the design doc, before any code is written against
+them.
+
+**New structural interface, `StatusSource`** (same pattern as
+`ClusterContext`, `CommitSource`/`ApplyTarget`):
+
+```ts
+export interface StatusSource {
+  nodeId: string;
+  state: string;
+  currentTerm: number;
+  commitIndex: number;
+  lastApplied: number;
+  currentLeaderId: string | null;
+}
+```
+
+`createApp`'s signature grows an **optional** third parameter:
+`createApp(store, cluster, status?: StatusSource)`. Optional, not
+required — `index.ts`'s `soloContext` path (Milestone 3, predates Raft)
+has no real `RaftNode` to source this from and must keep working
+unmodified, same reasoning as why `ClusterContext` itself didn't force
+`index.ts` into a fake cluster. If `status` is omitted, `/status` is not
+mounted at all — same "don't exist, not just gated" principle as
+`/debug/kill` below, applied consistently: `index.ts`'s solo mode
+genuinely doesn't have this data, so pretending to serve it would be
+worse than not having the route.
+
+`main.ts` constructs the real `StatusSource` as a thin live-reading
+object (getters, not a snapshot taken once at startup — must reflect
+current state on every poll):
+
+```ts
+const statusSource: StatusSource = {
+  get nodeId() { return node.nodeId; },
+  get state() { return node.state; },
+  get currentTerm() { return node.currentTerm; },
+  get commitIndex() { return node.commitIndex; }, // unverified, see above
+  get lastApplied() { return applyLoop.lastAppliedIndex; }, // unverified, see above
+  get currentLeaderId() { return node.currentLeaderId; },
+};
+```
+
+**Env-gated, route not mounted unless enabled:** `ENABLE_STATUS_ENDPOINT`
+env var, read in `main.ts`, controls whether the `status` argument is
+passed to `createApp` at all (undefined if not enabled → route absent,
+per above). Not gated inside the handler — the route structurally
+doesn't exist in an unconfigured environment, consistent with how
+`/debug/kill` is designed below and with this project's general
+"make the unsafe/unwanted state impossible, not just discouraged"
+instinct (e.g. `becomeLeader`'s required `peerIds` param).
+
+Reasoning for gating at all: DESIGN.md §2 already excludes auth/TLS as
+out of scope for this learning project; an always-on `/status` adds a
+small but real amount of unauthenticated internal-state exposure on top
+of that existing, already-documented gap. Gating it is cheap and
+explicit rather than silently expanding what §2's no-auth caveat covers.
+
+### 7.9.2 CORS
+
+`/status` alone gets a scoped CORS header
+(`Access-Control-Allow-Origin: *` or a configurable origin), added only
+on that route's response — not a general CORS opening of `/kv/:key` or
+the rest of the API. Needed because the dashboard is a plain static
+file (§7.9.5), likely opened from a different origin (`file://` or a
+separate static server) than the 3 node ports it polls.
+
+### 7.9.3 Request counters
+
+Tracked **client-side, in the dashboard**, not server-side. No new
+counter state added to `RaftNode`/`Store`/the API layer — that would be
+core-system state added purely to serve a peripheral UI concern. The
+dashboard already polls every node on an interval; it derives its own
+poll count and (if it's also the source of demo traffic) its own
+issued-request count. True cluster-wide write throughput, if ever
+wanted, is a separate, explicit future feature — not bundled in here.
+
+### 7.9.4 "Last failover" stat
+
+Computed entirely from the dashboard's own polling history — never
+server-reported. Per-poll: record which node (if any) reports
+`state === "leader"`. Transition from "some node was leader" to "no
+node currently reports leader" marks `t_lost`; the next poll where some
+node reports leader again marks `t_found`. Failover time = `t_found -
+t_lost`, displayed with an explicit "±poll interval" caveat in the UI
+itself, since this is bounded by polling resolution, not a precise
+server-side measurement — same honesty standard as §6.3's timing
+documentation.
+
+### 7.9.5 Dashboard delivery
+
+Single static `dashboard.html` (inline JS, no build step, no
+framework) — consistent with this project's "no unnecessary
+dependencies" instinct. No new server process and no new
+docker-compose service: the file is opened directly (local file or any
+static file server) and does client-side `fetch()` against each node's
+published client-API port. Requires §7.9.2's scoped CORS header on
+`/status` to work across origins.
+
+### 7.9.6 `/debug/kill`
+
+New route `POST /debug/kill` on the client-API app, calling
+`process.exit(1)` (nonzero, to distinguish demo-kill from clean
+shutdown in logs). **Structurally absent unless `ENABLE_KILL_ENDPOINT`
+is set** — the route is conditionally registered in `createApp`, not
+conditionally handled; an unconfigured environment has no such route to
+even probe for. docker-compose sets this env var on all 3 node
+services for live demo use; nothing else does. Explicitly a demo/ops
+toy, not held to this project's resilience-testing bar (§6) — it's a
+deliberate, blunt kill switch, not a feature under test.
+
+### 7.9.7 Status
+
+**Design locked and verified against real source** (`node.ts`,
+`applyLoop.ts`) — `RaftNode.commitIndex` and `ApplyLoop.lastAppliedIndex`
+both confirmed as public getters, matching §7.9.1's `StatusSource`
+shape exactly. Ready for implementation.
+
 ## 8. Architecture Decision Records (ADRs)
 
 **ADR-1: HTTP/JSON over gRPC for all RPCs**
