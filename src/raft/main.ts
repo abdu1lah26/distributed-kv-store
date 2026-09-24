@@ -1,4 +1,5 @@
-// Combined Raft node entrypoint (Milestone 5, Step 6.6).
+// Combined Raft node entrypoint (Milestone 5, Step 6.6; extended
+// Milestone 9, DESIGN.md §7.9 for dashboard support).
 //
 // Supersedes the Milestone 4 raft-only main.ts: this is the one real
 // process per node — owns the Store lifecycle, the RaftNode state
@@ -19,7 +20,7 @@ import { parseClusterConfig, type PeerConfig } from "../cluster/config.js";
 import { Store } from "../storage/store.js";
 import { ApplyLoop } from "./applyLoop.js";
 import { proposeWrite } from "./writePath.js";
-import { createApp, type ClusterContext } from "../api/server.js";
+import { createApp, type ClusterContext, type StatusSource, type AppFeatures } from "../api/server.js";
 import type { LogCommand } from "./log.js";
 
 // Demo-tuned, same family as the existing 100ms peer-timeout / 50ms
@@ -77,6 +78,39 @@ function buildLeaderRedirectHint(
   }
 
   return { leaderId, url: `http://${peer.host}:${peer.clientPort}` };
+}
+
+/**
+ * Builds a live-reading StatusSource (DESIGN.md §7.9.1) backed directly
+ * by the real node/applyLoop — getters, not a snapshot taken once here,
+ * so every GET /status reflects genuinely current state at poll time,
+ * not whatever term/commitIndex happened to be true when main() ran.
+ * Both fields were verified directly against real node.ts/applyLoop.ts
+ * source before this was written (§7.9.7) — node.commitIndex and
+ * applyLoop.lastAppliedIndex are both real public getters, not assumed
+ * from DESIGN.md prose.
+ */
+function buildStatusSource(node: RaftNode, applyLoop: ApplyLoop): StatusSource {
+  return {
+    get nodeId() {
+      return node.nodeId;
+    },
+    get state() {
+      return node.state;
+    },
+    get currentTerm() {
+      return node.currentTerm;
+    },
+    get commitIndex() {
+      return node.commitIndex;
+    },
+    get lastApplied() {
+      return applyLoop.lastAppliedIndex;
+    },
+    get currentLeaderId() {
+      return node.currentLeaderId;
+    },
+  };
 }
 
 async function main(): Promise<void> {
@@ -158,10 +192,21 @@ async function main(): Promise<void> {
     write: (command: LogCommand) => proposeWrite(node, config.peers, applyLoop, command),
   };
 
+  // Milestone 9 (DESIGN.md §7.9.1, §7.9.6): both dashboard-support
+  // routes are structurally absent from the app unless explicitly
+  // opted into via env var — not mounted-but-gated. Read here, once,
+  // at startup; not re-checked per-request, since these are meant to be
+  // fixed per-process configuration (matching how every other env var
+  // in this file, e.g. DATA_DIR, is read once in main()).
+  const features: AppFeatures = {
+    status: process.env.ENABLE_STATUS_ENDPOINT === "true" ? buildStatusSource(node, applyLoop) : undefined,
+    enableKill: process.env.ENABLE_KILL_ENDPOINT === "true",
+  };
+
   const raftApp = createRaftApp(node);
   const raftServer = http.createServer(raftApp);
 
-  const clientApp = createApp(store, clusterContext);
+  const clientApp = createApp(store, clusterContext, features);
   const clientServer = http.createServer(clientApp);
 
   // Bind 0.0.0.0, not localhost: these are separate OS processes (in
@@ -178,6 +223,12 @@ async function main(): Promise<void> {
 
   clientServer.listen(config.clientPort, "0.0.0.0", () => {
     console.log(`[${config.nodeId}] client API listening on 0.0.0.0:${config.clientPort}`);
+    if (features.status !== undefined) {
+      console.log(`[${config.nodeId}] /status enabled`);
+    }
+    if (features.enableKill === true) {
+      console.log(`[${config.nodeId}] /debug/kill enabled`);
+    }
   });
 
   function shutdown(signal: string): void {

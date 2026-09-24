@@ -35,6 +35,57 @@ export interface ClusterContext {
 }
 
 /**
+ * Structural interface describing exactly what the /status route needs
+ * (Milestone 9 / DESIGN.md §7.9.1) — same "small structural interface,
+ * not the concrete class" pattern as ClusterContext above and
+ * CommitSource/ApplyTarget (applyLoop.ts). Verified directly against
+ * real node.ts/applyLoop.ts source before this was written (§7.9.7) —
+ * commitIndex is a real RaftNode getter, lastApplied maps to
+ * ApplyLoop.lastAppliedIndex.
+ *
+ * Deliberately all getters/readonly, mirroring how main.ts's real
+ * implementation is expected to be built: live-reading accessors backed
+ * by a real RaftNode + ApplyLoop, not a one-time snapshot taken at
+ * construction. A fake for tests can just use plain properties instead —
+ * readonly here only documents the contract, TypeScript's structural
+ * typing doesn't require the fake to use get syntax too.
+ */
+export interface StatusSource {
+  readonly nodeId: string;
+  readonly state: string;
+  readonly currentTerm: number;
+  readonly commitIndex: number;
+  readonly lastApplied: number;
+  readonly currentLeaderId: string | null;
+}
+
+/**
+ * Optional features bundle for createApp, grouped into one object
+ * rather than more positional params — same reasoning as ClusterContext
+ * itself: a named, structural bag is easier to extend later (e.g. a
+ * future configurable CORS origin) without yet another breaking
+ * positional-signature change, per this project's established
+ * "evolve in place" precedent (Step 4's AppendEntriesRequest move,
+ * Step 6.1's config format change, Step 6.5's ClusterContext param).
+ */
+export interface AppFeatures {
+  /**
+   * If provided, mounts GET /status. If omitted, the route is not
+   * mounted at all — not present-but-empty, not gated inside the
+   * handler. DESIGN.md §7.9.1: index.ts's solo mode has no real Raft
+   * state to source this from and must keep working without it.
+   */
+  status?: StatusSource | undefined;
+  /**
+   * If true, mounts POST /debug/kill (process.exit(1)). If false/
+   * omitted, the route is not mounted at all — same "structurally
+   * absent, not gated" principle as status above and as becomeLeader's
+   * required peerIds param. DESIGN.md §7.9.6.
+   */
+  enableKill?: boolean | undefined;
+}
+
+/**
  * Builds an Express app wired to the given Store instance and Raft
  * cluster context.
  *
@@ -51,6 +102,10 @@ export interface ClusterContext {
  * Step 4's AppendEntriesRequest move and Step 6.1's config format
  * change.
  *
+ * Milestone 9 (DESIGN.md §7.9) adds an optional third parameter,
+ * `features` — additive, not breaking: every existing 2-arg call site
+ * (index.ts, existing tests) is unaffected. See AppFeatures above.
+ *
  * Request-body validation on PUT happens BEFORE the leader check,
  * deliberately: a malformed body is a client error regardless of which
  * node receives it — redirecting the client to another node first would
@@ -63,7 +118,7 @@ export interface ClusterContext {
  * constructible in tests without a real socket (see supertest usage
  * in test/api.test.ts).
  */
-export function createApp(store: Store, cluster: ClusterContext): Express {
+export function createApp(store: Store, cluster: ClusterContext, features?: AppFeatures): Express {
   const app = express();
   app.use(express.json());
 
@@ -177,6 +232,51 @@ export function createApp(store: Store, cluster: ClusterContext): Express {
       next(err);
     }
   });
+
+  // ---- Milestone 9 (DESIGN.md §7.9): dashboard support routes ----
+  // Both are structurally absent unless explicitly opted into via
+  // `features` — not mounted-but-gated-inside-the-handler. An
+  // unconfigured environment (including every existing test/call site
+  // that doesn't pass `features`) has no way to even discover these
+  // routes exist, consistent with this project's "make the unwanted
+  // state impossible, not just discouraged" instinct (becomeLeader's
+  // required peerIds param is the precedent cited in DESIGN.md §7.9.1).
+
+  if (features?.status !== undefined) {
+    const status = features.status;
+
+    app.get("/status", (_req: Request, res: Response) => {
+      // Scoped CORS: only this route, not a general opening of the API
+      // (DESIGN.md §7.9.2). The dashboard is a plain static file
+      // (§7.9.5), likely opened from a different origin (file:// or a
+      // separate static server) than the 3 node ports it polls.
+      res.set("Access-Control-Allow-Origin", "*");
+      res.status(200).json({
+        nodeId: status.nodeId,
+        state: status.state,
+        currentTerm: status.currentTerm,
+        commitIndex: status.commitIndex,
+        lastApplied: status.lastApplied,
+        currentLeaderId: status.currentLeaderId,
+      });
+    });
+  }
+
+    if (features?.enableKill === true) {
+    app.post("/debug/kill", (_req: Request, res: Response) => {
+      // Wait for the real 'finish' event — confirms the response was
+      // actually flushed to the client — rather than a guessed delay.
+      // This project has already learned, repeatedly (§4.4.5's kill
+      // detection, §6.3's whole burst-tuning saga), that an arbitrary
+      // timing constant is not a substitute for a real signal when one
+      // exists. Nonzero exit code to distinguish a deliberate demo-kill
+      // from clean shutdown in any container/process logs (§7.9.6).
+      res.on("finish", () => {
+        process.exit(1);
+      });
+      res.status(200).json({ killed: true });
+    });
+  }
 
   // Unknown routes -> JSON 404, not Express's default HTML page.
   app.use((_req: Request, res: Response) => {

@@ -1016,6 +1016,117 @@ deliberate, blunt kill switch, not a feature under test.
 both confirmed as public getters, matching §7.9.1's `StatusSource`
 shape exactly. Ready for implementation.
 
+### 7.9.8 Unreproduced Incident — node-a `/status` Silent Non-Response (Milestone 9)
+
+**During initial manual verification** (§7.9.7's follow-up), a single
+`curl -s localhost:5001/status` against node-a returned completely
+empty — no JSON, no HTTP error, no output at all — during a 3-node
+manual check, shortly after a PUT was committed through a different
+node acting as leader. The originating terminal's scrollback was not
+captured before the terminal was closed, so the actual cause (crash?
+hang? something else entirely?) could not be determined from that
+session.
+
+**Leading hypothesis at the time:** `main.ts`'s apply-loop interval
+treats a failed `applyLoop.applyCommitted()` as fatal
+(`process.exit(1)`, per Step 6.3's "loud failure over silent
+ambiguity" design) — a crash there would kill the whole process,
+including the client-API server, and a subsequent `curl -s` against a
+now-dead port returns exactly this: nothing, not a connection-refused
+message. Plausible, but never confirmed — no stack trace or log line
+was ever captured for the original incident itself.
+
+**Three genuine reproduction attempts, methodically escalating —
+none reproduced it:**
+
+1. Re-ran the full 3-node cluster fresh; node-a became leader this
+   time (not node-c, as in the original run) — didn't match the
+   original conditions (node-a as follower applying a replicated
+   write), so inconclusive by construction, not evidence either way.
+2. Re-ran again, this time deliberately sending the PUT to whichever
+   node was actually leader (node-b) and continuously polling node-a's
+   `/status` throughout the entire write, rather than checking once
+   after the fact — the closest match to the original conditions
+   (node-a as follower, applying a real replicated write). Polling
+   loop never showed a gap; node-a stayed healthy the entire time.
+3. Repeated once more with full `2>&1 | tee` log capture on all 3
+   nodes from process startup, specifically so a recurrence would
+   leave a real artifact instead of relying on live terminal-watching
+   again. Leader this run was node-a itself. Clean run throughout;
+   all 3 logs show only normal startup/election/status output — no
+   `FATAL`, no stack trace, no anomaly of any kind.
+
+**Honest conclusion:** the incident is real (it was directly observed
+once, via a genuinely empty curl response, not imagined or
+misread) but has not been reproduced across 3 separately-varied,
+deliberate attempts, including one with full log capture that would
+have caught it. Per this project's own standing discipline (§6.3,
+§6.5) — a single unreproduced anomaly with no captured evidence is
+neither dismissed as certainly benign nor treated as a confirmed,
+open bug blocking further work. **Status: closed as unreproduced,
+not confirmed absent.** If this recurs, the priority is capturing the
+originating terminal's output (or running with `tee` proactively) at
+the moment it happens, before anything is closed or restarted —
+the single biggest gap in investigating the original occurrence was
+losing that scrollback before it could be inspected.
+
+**Not ruled out, for honesty's sake:** a rare timing-dependent
+condition in the apply-loop or election path that these 3 runs simply
+didn't hit — same category of "infrequent genuine non-determinism, not
+fully characterizable by this project's black-box tooling" as §6.5's
+concurrent-writes finding. This is different from §6.5 in one
+important way: §6.5 had a *quantified* rate (11/12 vs 1/12) from a
+controlled repeated-trial setup. This incident has an observed count
+of 1-in-4 casual manual runs, under conditions that were not
+controlled or repeated identically enough to call that a rate — stated
+as a single unexplained data point, not extrapolated into a frequency.
+
+### 7.9.9 Automated Coverage — `test/raft-dashboard.test.ts` (Milestone 9)
+
+**Result: PASS.** 3/3 clean runs, zero orphaned processes after each,
+matching the discipline established for every other real-cluster
+integration test in this project (§6.1, §6.4, §6.6.7).
+
+Real 3-process cluster with `ENABLE_STATUS_ENDPOINT=true` and
+`ENABLE_KILL_ENDPOINT=true`, pinning exactly what §7.9.7's manual
+verification (and §7.9.8's investigation) already established by hand:
+
+* Election settles to exactly one agreed leader, with all 3 nodes'
+  `/status` reporting the same `currentTerm` and `currentLeaderId`.
+* A real `PUT` through the real leader propagates: `commitIndex` and
+  `lastApplied` converge to equal values across all 3 nodes.
+* A real `POST /debug/kill` against the real leader returns `{killed:
+  true}`, the process actually exits, and the 2 survivors elect a
+  genuinely different node at a strictly higher term.
+
+**Deliberately not asserted**, stated explicitly rather than left
+implicit:
+
+* The transient `commitIndex > lastApplied` window between commit and
+  apply — real (25ms apply-poll interval, §Step 6.6), but too narrow to
+  assert on reliably without reintroducing exactly the kind of
+  timing-constant fragility this project has already learned to avoid
+  (§6.3's whole burst-tuning saga). The manual runs already confirmed
+  this window exists; this file only asserts the two values converge,
+  not the shape of getting there.
+* The specific term-skip behavior observed manually (e.g. term 4 → 6
+  after a kill) — ordinary split-vote contention, already covered by
+  the pre-existing election tests, not a dashboard-specific concern.
+
+Uses `mkdtemp`-isolated `DATA_DIR` per node from the start, ahead of
+the tracked cleanup item in §6.2 rather than adding to it — this file
+specifically needed that guarantee, given §7.9.8's original incident
+was about one node's own process/on-disk state.
+
+**Status: Section 7 item 9 (dashboard stretch) complete** — design
+locked and verified against real source (§7.9.7), manually verified
+end-to-end including a real `/debug/kill`-triggered re-election against
+a live quorum (§7.9.7 follow-up), one investigated-and-honestly-closed
+anomaly (§7.9.8), and now automated regression coverage for the real
+`main.ts` wiring (this section) sitting alongside the pre-existing
+isolated route-mechanics test (`test/dashboard.test.ts`). No further
+open items for this feature.
+
 ## 8. Architecture Decision Records (ADRs)
 
 **ADR-1: HTTP/JSON over gRPC for all RPCs**
