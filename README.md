@@ -85,6 +85,41 @@ If `node-b` was a follower, it rejoins and catches up via replication.
 If it was the leader, the surviving two elect a new leader while it's
 down (watch `docker compose logs -f` to see the term change).
 
+## Dashboard
+
+`dashboard.html` (repo root) is a single static page, with no build step
+and no server. Open it directly in a browser while the cluster is
+running. It polls each node's `/status` every second and shows one card
+per node: state (follower / candidate / leader / unreachable), term,
+commit index, last applied, and who that node believes the leader is.
+
+It works against both `docker compose up --build` (the two env vars it
+needs are already set in `docker-compose.yml`) and bare-metal runs, as
+long as you start each node with:
+
+​```bash
+ENABLE_STATUS_ENDPOINT=true ENABLE_KILL_ENDPOINT=true
+​```
+
+Things worth knowing before you trust what it shows:
+
+- **Ports are hardcoded** to `5001`-`5003` in the `NODES` array at the
+  top of the script. Edit it if your cluster uses different client ports.
+- **"Last failover" is approximate.** It's measured from the dashboard's
+  own polling (the time between "no leader visible" and "a leader
+  visible"), so it's only accurate to about the 1s poll interval. It
+  shows "not yet observed" until a real failover happens.
+- **"Unreachable" is its own state**, shown in gray. A node that's down,
+  restarting, or just killed is reported as unreachable rather than as
+  frozen stale data.
+- **The Kill button** asks for confirmation, then calls
+  `POST /debug/kill` on that node, which ends its process. In Docker
+  the container stays stopped (there is no restart policy), so bring it
+  back with `docker compose start node-x`.
+- **Both routes are unauthenticated** (no auth is a stated non-goal,
+  `DESIGN.md` §2), and neither exists unless its env var is set. The
+  routes are not mounted at all otherwise, not merely rejected.
+
 ## Consistency model — read this before assuming more than the system promises
 
 - **Writes** are only accepted by the leader, and only return success

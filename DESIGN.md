@@ -1127,6 +1127,41 @@ anomaly (§7.9.8), and now automated regression coverage for the real
 isolated route-mechanics test (`test/dashboard.test.ts`). No further
 open items for this feature.
 
+### 7.9.10 Frontend — `dashboard.html` (Milestone 9)
+
+**Result: delivered and manually verified.** A single static file,
+inline CSS and JS, no framework and no build step (§7.9.5), polling the
+3 nodes' `/status` every 1s.
+
+Design decisions, settled before writing the page:
+
+* **Hardcoded poll targets** (`5001`-`5003`). It's a demo tool for this
+  project's 3-node setup, so a query parameter or config file would be
+  solving a problem nobody has.
+* **A distinct "unreachable" state**, gray rather than alarming red.
+  A failed poll must never leave a card frozen on stale data. This also
+  covers the brief window after `/debug/kill` returns 200 but before the
+  process has actually exited: the next poll either still succeeds or
+  fails into "unreachable", and both are honest.
+* **Failover stat tracks only two conditions**: zero leaders visible vs.
+  at least one visible. Transient multi-leader disagreement mid-election
+  is ordinary election noise and is deliberately not special-cased.
+  Shows "not yet observed" until a real transition, never a fabricated
+  `0.00s`, and is labeled with its ±poll-interval resolution (§7.9.4).
+* **Kill uses a plain `confirm()`**, proportionate to a demo tool's
+  actual risk. The kill request's own response is not trusted to
+  decide UI state (it can race the process exiting); the next poll is
+  the source of truth.
+
+**Verification:** run against a live 3-node cluster both bare-metal and
+under Docker Compose (`ENABLE_STATUS_ENDPOINT`/`ENABLE_KILL_ENDPOINT`
+added to all 3 services, quoted as strings, see the compose header
+comment). Observed by hand: cards populating with exactly one agreed
+leader, `commitIndex`/`lastApplied` advancing live after a real PUT,
+and the Kill button triggering a real re-election. Not covered by any
+automated test, since the page is a browser artifact; the backend it
+consumes is covered by §7.9.9.
+
 ## 8. Architecture Decision Records (ADRs)
 
 **ADR-1: HTTP/JSON over gRPC for all RPCs**
@@ -1177,4 +1212,36 @@ Going forward: a new unit test for a single module → `src/test/`. A new test t
 * Paste this whole file at the start of any new Claude conversation about this project, or keep it in the repo root for Claude Code to read directly.
 * Update it BEFORE changing scope, not after — if you're tempted to add something not listed here, add it to Section 2/7 first, then build it.
 * **When in doubt about what a module's actual current interface is, check the real file on disk before trusting recollection from earlier in a conversation** — this file has already caught one real drift incident (Section 4.4.2) where a described interface and the actual implemented one disagreed after a long back-and-forth.
+
+## 11. Project Status
+
+**All 9 items in Section 7 are complete**, including the optional
+stretch item: storage engine (WAL, MemTable with tombstones, SSTable,
+Bloom filter), REST API, Raft leader election, log replication with
+commit index, leader-only client writes with `421 NOT_LEADER`
+redirects, the five Section 6 failure-model tests (§6.1-6.5), Docker
+Compose (verified end to end), and the dashboard (§7.9).
+
+**Open and tracked, not hidden:**
+
+* **§5.3.2, `RaftLog` is in-memory only.** The one real correctness gap.
+  Applied entries survive a full-cluster crash via each node's own
+  Store WAL, but committed-but-unapplied and uncommitted entries do not
+  (proven deterministically in §6.2 Part B). Resolving it needs
+  WAL-backed Raft log persistence or an equivalent.
+* **§7.9.8, one unreproduced anomaly.** A single empty `/status`
+  response, never reproduced across 3 deliberate attempts. Closed as
+  "unreproduced, not confirmed absent."
+* **Test cleanup items:** `raft-election`, `raft-write-path`, and
+  `raft-follower-crash` still use the default cwd-relative `DATA_DIR`
+  rather than isolated temp directories (§6.2). Integration test
+  files intentionally keep their own copies of the spawn/kill/poll
+  helpers rather than sharing a module, so one helper bug can't
+  silently affect every file (test #5's design note); revisit only if
+  that duplication starts causing real pain.
+
+**Documented tradeoffs, not gaps:** follower reads can lag the leader
+by the apply-poll interval (§3); no auth/TLS (§2); `/status` and
+`/debug/kill` are opt-in demo features and structurally absent unless
+enabled (§7.9).
 ```

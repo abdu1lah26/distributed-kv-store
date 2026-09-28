@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Raft KV Cluster Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --card-bg: #171a21;
+    --border: #2a2e37;
+    --text: #e6e8eb;
+    --muted: #8b909c;
+
+    --follower: #3b82f6;
+    --candidate: #eab308;
+    --leader: #22c55e;
+    --unreachable: #4b5563;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    padding: 32px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+
+  h1 {
+    font-size: 20px;
+    font-weight: 600;
+    margin: 0 0 4px 0;
+  }
+
+  .subtitle {
+    color: var(--muted);
+    font-size: 13px;
+    margin-bottom: 24px;
+  }
+
+  .stat-bar {
+    display: flex;
+    gap: 24px;
+    margin-bottom: 24px;
+    padding: 14px 18px;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 13px;
+    color: var(--muted);
+  }
+
+  .stat-bar strong {
+    color: var(--text);
+    font-weight: 600;
+  }
+
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+  }
+
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px;
+  }
+
+  .card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 14px;
+  }
+
+  .node-id {
+    font-weight: 600;
+    font-size: 15px;
+  }
+
+  .badge {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 3px 9px;
+    border-radius: 999px;
+    color: #0f1115;
+  }
+
+  .badge-follower { background: var(--follower); color: #fff; }
+  .badge-candidate { background: var(--candidate); }
+  .badge-leader { background: var(--leader); color: #0f1115; }
+  .badge-unreachable { background: var(--unreachable); color: #cbd0d8; }
+
+  .field {
+    display: flex;
+    justify-content: space-between;
+    font-size: 13px;
+    padding: 4px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+
+  .field:last-of-type { border-bottom: none; }
+
+  .field .label { color: var(--muted); }
+  .field .value { font-variant-numeric: tabular-nums; }
+
+  .kill-btn {
+    margin-top: 14px;
+    width: 100%;
+    padding: 8px;
+    background: transparent;
+    border: 1px solid #b91c1c;
+    color: #f87171;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .kill-btn:hover { background: rgba(185, 28, 28, 0.15); }
+  .kill-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .unreachable-note {
+    font-size: 12px;
+    color: var(--muted);
+    font-style: italic;
+    padding: 4px 0;
+  }
+</style>
+</head>
+<body>
+
+  <h1>Raft KV Cluster</h1>
+  <div class="subtitle">Live status, polled every 1s. Not a precision instrument — see caveats below.</div>
+
+  <div class="stat-bar">
+    <div>Last failover: <strong id="failover-stat">not yet observed</strong></div>
+    <div>Polls: <strong id="poll-count">0</strong></div>
+  </div>
+
+  <div class="cards" id="cards"></div>
+
+  <script>
+    // ---- Config ----
+    // Hardcoded to match this project's 3-node demo setup
+    // (DESIGN.md §6/§7.1). If your cluster uses different client
+    // ports, edit this array — no query-param/config-file support,
+    // deliberately, per this project's "no unnecessary complexity for
+    // a demo tool" instinct (DESIGN.md §7.9.5).
+    const NODES = [
+      { id: "node-a", port: 5001 },
+      { id: "node-b", port: 5002 },
+      { id: "node-c", port: 5003 },
+    ];
+
+    const POLL_INTERVAL_MS = 1000;
+
+    // ---- State ----
+    let pollCount = 0;
+    // Tracks whether a leader was visible on the PREVIOUS poll, to
+    // detect the zero-leaders <-> one-leader transition (DESIGN.md
+    // §7.9.4). Three values: null (no poll completed yet -- "not yet
+    // observed"), true (a leader was visible last poll), false (no
+    // leader was visible last poll).
+    let leaderWasVisible = null;
+    let failoverLostAt = null; // timestamp when leader visibility was last lost
+    let lastFailoverDurationMs = null;
+
+    const latestByNode = new Map(); // nodeId -> { status } | { unreachable: true }
+
+    function renderFailoverStat() {
+      const el = document.getElementById("failover-stat");
+      if (lastFailoverDurationMs === null) {
+        el.textContent = "not yet observed";
+      } else {
+        el.textContent = `${(lastFailoverDurationMs / 1000).toFixed(2)}s (\u00B1${POLL_INTERVAL_MS}ms poll interval)`;
+      }
+    }
+
+    function badgeClass(state) {
+      switch (state) {
+        case "leader": return "badge-leader";
+        case "candidate": return "badge-candidate";
+        case "follower": return "badge-follower";
+        default: return "badge-unreachable";
+      }
+    }
+
+    function renderCards() {
+      const container = document.getElementById("cards");
+      container.innerHTML = "";
+
+      for (const node of NODES) {
+        const entry = latestByNode.get(node.id);
+        const card = document.createElement("div");
+        card.className = "card";
+
+        if (!entry || entry.unreachable) {
+          card.innerHTML = `
+            <div class="card-header">
+              <div class="node-id">${node.id}</div>
+              <div class="badge badge-unreachable">unreachable</div>
+            </div>
+            <div class="unreachable-note">No response from :${node.port}. Down, restarting, or between polls.</div>
+            <button class="kill-btn" disabled>Kill node (offline)</button>
+          `;
+          container.appendChild(card);
+          continue;
+        }
+
+        const s = entry.status;
+        card.innerHTML = `
+          <div class="card-header">
+            <div class="node-id">${s.nodeId}</div>
+            <div class="badge ${badgeClass(s.state)}">${s.state}</div>
+          </div>
+          <div class="field"><span class="label">Term</span><span class="value">${s.currentTerm}</span></div>
+          <div class="field"><span class="label">Commit index</span><span class="value">${s.commitIndex}</span></div>
+          <div class="field"><span class="label">Last applied</span><span class="value">${s.lastApplied}</span></div>
+          <div class="field"><span class="label">Believed leader</span><span class="value">${s.currentLeaderId ?? "\u2014"}</span></div>
+          <button class="kill-btn" data-port="${node.port}" data-id="${node.id}">Kill node</button>
+        `;
+        container.appendChild(card);
+      }
+
+      // Wire up kill buttons freshly each render (innerHTML rebuild
+      // above discards any prior listeners).
+      container.querySelectorAll(".kill-btn[data-port]").forEach((btn) => {
+        btn.addEventListener("click", onKillClick);
+      });
+    }
+
+    async function onKillClick(evt) {
+      const port = evt.currentTarget.getAttribute("data-port");
+      const id = evt.currentTarget.getAttribute("data-id");
+
+      // Plain confirm() — proportionate to a demo tool's actual risk,
+      // not a heavier two-step arm/fire pattern (deliberate choice,
+      // not an oversight).
+      const ok = confirm(`Kill ${id} (port ${port})? This will end its process immediately.`);
+      if (!ok) return;
+
+      evt.currentTarget.disabled = true;
+      try {
+        await fetch(`http://localhost:${port}/debug/kill`, { method: "POST" });
+        // Deliberately not awaiting/checking the JSON body or handling
+        // errors specially here: whether this resolves normally or the
+        // connection drops mid-response (a real race against the
+        // process actually exiting, same as DESIGN.md §7.9's
+        // finish-event note on the server side), the next poll cycle
+        // will correctly show this node as unreachable either way.
+      } catch {
+        // Same reasoning — a network-level failure here still means
+        // "we can't confirm success," and the poll loop is the source
+        // of truth for what actually happened, not this response.
+      }
+    }
+
+    async function pollOnce() {
+      const results = await Promise.allSettled(
+        NODES.map(async (node) => {
+          const res = await fetch(`http://localhost:${node.port}/status`);
+          if (!res.ok) throw new Error(`status ${res.status}`);
+          return await res.json();
+        }),
+      );
+
+      results.forEach((result, i) => {
+        const node = NODES[i];
+        if (result.status === "fulfilled") {
+          latestByNode.set(node.id, { status: result.value });
+        } else {
+          latestByNode.set(node.id, { unreachable: true });
+        }
+      });
+
+      // ---- Failover tracking (DESIGN.md §7.9.4) ----
+      // Exactly two conditions tracked: zero-leaders-visible vs
+      // exactly-one-leader-visible. A transient multi-leader
+      // disagreement mid-election is real election noise, not a
+      // distinct state, and is deliberately not special-cased.
+      const leaderCount = Array.from(latestByNode.values()).filter(
+        (e) => !e.unreachable && e.status.state === "leader",
+      ).length;
+      const leaderVisibleNow = leaderCount >= 1;
+
+      if (leaderWasVisible === true && !leaderVisibleNow) {
+        failoverLostAt = Date.now();
+      } else if (leaderWasVisible === false && leaderVisibleNow && failoverLostAt !== null) {
+        lastFailoverDurationMs = Date.now() - failoverLostAt;
+        failoverLostAt = null;
+      }
+      leaderWasVisible = leaderVisibleNow;
+
+      pollCount += 1;
+      document.getElementById("poll-count").textContent = String(pollCount);
+      renderFailoverStat();
+      renderCards();
+    }
+
+    renderCards(); // initial render: all cards show "unreachable" until first poll completes
+    pollOnce();
+    setInterval(pollOnce, POLL_INTERVAL_MS);
+  </script>
+
+</body>
+</html>

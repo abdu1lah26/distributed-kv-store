@@ -1,3 +1,9 @@
+# ENABLE_STATUS_ENDPOINT / ENABLE_KILL_ENDPOINT are quoted strings on
+# purpose: main.ts checks === "true", and an unquoted YAML `true` is
+# parsed as a boolean, which would silently disable both dashboard
+# routes. Both are demo features, on here so dashboard.html works
+# against the containers. Remove them for any non-demo deployment.
+
 # 3-node Raft cluster. All 3 services build from the same Dockerfile;
 # they differ only in NODE_ID/PORT/CLIENT_PORT/PEERS/DATA_DIR, exactly
 # mirroring how you'd run 3 separate `tsx src/raft/main.ts` processes
@@ -17,7 +23,6 @@
 # Only CLIENT_PORTs are published to the host, matching the real
 # deployment shape: a curl client needs the client API, never direct
 # access to inter-node Raft-RPC traffic.
-
 services:
   node-a:
     build: .
@@ -28,6 +33,8 @@ services:
       CLIENT_PORT: "5001"
       DATA_DIR: /app/data/node-a
       PEERS: node-b=node-b:4002:5002,node-c=node-c:4003:5003
+      ENABLE_STATUS_ENDPOINT: "true"
+      ENABLE_KILL_ENDPOINT: "true"
     volumes:
       - node-a-data:/app/data/node-a
     ports:
@@ -44,6 +51,8 @@ services:
       CLIENT_PORT: "5002"
       DATA_DIR: /app/data/node-b
       PEERS: node-a=node-a:4001:5001,node-c=node-c:4003:5003
+      ENABLE_STATUS_ENDPOINT: "true"
+      ENABLE_KILL_ENDPOINT: "true"
     volumes:
       - node-b-data:/app/data/node-b
     ports:
@@ -60,6 +69,8 @@ services:
       CLIENT_PORT: "5003"
       DATA_DIR: /app/data/node-c
       PEERS: node-a=node-a:4001:5001,node-b=node-b:4002:5002
+      ENABLE_STATUS_ENDPOINT: "true"
+      ENABLE_KILL_ENDPOINT: "true"
     volumes:
       - node-c-data:/app/data/node-c
     ports:
